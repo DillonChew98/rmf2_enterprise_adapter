@@ -1,0 +1,24 @@
+[package]
+name = "rmf2_enterprise_adapter"
+version = "0.1.0"
+edition = "2024"
+# `cargo run` -> the adapter/controller; `cargo run --bin mock_device` -> the device.
+default-run = "rmf2_enterprise_adapter"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bb8 = "0.8"
+bb8-tiberius = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+rumqttc = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

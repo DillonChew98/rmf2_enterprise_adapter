@@ -1,0 +1,10 @@
+# Keep the adapter build context small — only Cargo.*, src/, sql/, chemicals.txt
+# are needed.
+target/
+modules/
+.git/
+.claude/
+*.log
+mix_presets.json
+adapter.env
+.env

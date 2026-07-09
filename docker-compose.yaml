@@ -1,0 +1,101 @@
+services:
+  # ── Enterprise adapter (Rust controller: LIMS + device REST API) ──────────
+  adapter:
+    build:
+      context: .
+    image: rmf2-enterprise-adapter:latest
+    container_name: enterprise-adapter
+    env_file: adapter.env
+    ports:
+      - "7900:7900"
+    restart: unless-stopped
+
+  # ── Operator UI (static build served by nginx; proxies /api -> adapter) ───
+  ui:
+    build:
+      context: ./modules/enterprise-ui
+    image: rmf2-enterprise-ui:latest
+    container_name: enterprise-ui
+    ports:
+      - "8080:80"
+    depends_on:
+      - adapter
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Demo / local-test stack (profile: demo)
+  #   docker compose --profile demo up -d --build
+  # brings up a self-contained environment: SQL Server + seed + MQTT broker +
+  # a simulated delayering machine. In production these are EXTERNAL — leave the
+  # profile off and point adapter.env at your real LIMS / broker / machine.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: enterprise-adapter-mssql
+    profiles: ["demo"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Your_strong_Pass123"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+
+  # One-shot: wait for SQL Server, then create + seed the mock LIMS. Reuses the
+  # server image (it bundles sqlcmd) so no separate tools image is needed.
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: enterprise-adapter-mssql-init
+    profiles: ["demo"]
+    depends_on:
+      - mssql
+    environment:
+      MSSQL_SA_PASSWORD: "Your_strong_Pass123"
+    volumes:
+      - ./sql:/sql:ro
+    entrypoint:
+      - bash
+      - -c
+      - |
+        SQLCMD=$$(ls /opt/mssql-tools18/bin/sqlcmd 2>/dev/null || ls /opt/mssql-tools/bin/sqlcmd 2>/dev/null);
+        echo "Using sqlcmd at $$SQLCMD";
+        echo "Waiting for SQL Server...";
+        for i in $$(seq 1 60); do
+          $$SQLCMD -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" && break;
+          sleep 2;
+        done;
+        echo "Creating schema...";
+        $$SQLCMD -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -i /sql/0001_schema.sql;
+        echo "Seeding data...";
+        $$SQLCMD -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -d LIMS -i /sql/0002_seed.sql;
+        echo "LIMS mock ready.";
+
+  # MQTT broker for the device link (adapter <-> mock device).
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: enterprise-adapter-mosquitto
+    profiles: ["demo"]
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  # Simulated delayering machine — reuses the adapter image, runs the other bin.
+  mock-device:
+    image: rmf2-enterprise-adapter:latest
+    container_name: enterprise-adapter-mock-device
+    profiles: ["demo"]
+    command: ["mock_device"]
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MACHINE_MANUFACTURER: acme-delayer
+      MACHINE_DEVICE_ID: delayer-01
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+volumes:
+  mssql_data:

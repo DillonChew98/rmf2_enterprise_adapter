@@ -1,0 +1,9 @@
+# Delayering chemical catalog — one chemical per line. Edit and restart the
+# adapter; the UI re-fetches from GET /api/chemicals. Lines starting with # are
+# comments. If this file is missing/empty, the built-in defaults are used.
+BOE
+HCl
+HNO3
+HF
+Poly etch (MAE)
+Choline hydroxide

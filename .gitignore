@@ -1,0 +1,6 @@
+/target
+
+# Local secrets / runtime state — never commit.
+adapter.env
+.env
+mix_presets.json
