@@ -16,6 +16,9 @@ pub struct MssqlConfig {
     pub user: String,
     pub password: String,
     pub trust_cert: bool,
+    /// Path to a CA certificate (PEM) to verify the server against — e.g. an
+    /// internal/corporate CA. Ignored when `trust_cert` is true.
+    pub ca_cert_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +65,10 @@ impl Config {
             trust_cert: env::var("MSSQL_TRUST_CERT")
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
+            // Optional CA cert (PEM) to verify against when trust_cert=false.
+            ca_cert_path: env::var("MSSQL_CA_CERT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         };
 
         let mqtt = MqttConfig {

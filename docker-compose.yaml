@@ -8,6 +8,10 @@ services:
     env_file: adapter.env
     ports:
       - "7900:7900"
+    # Read-only mount for a LIMS CA cert (used when MSSQL_TRUST_CERT=false and
+    # MSSQL_CA_CERT=/certs/<file>.pem). Harmless when unused.
+    volumes:
+      - ./certs:/certs:ro
     restart: unless-stopped
 
   # ── Operator UI (static build served by nginx; proxies /api -> adapter) ───

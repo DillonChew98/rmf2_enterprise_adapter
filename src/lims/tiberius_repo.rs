@@ -1,13 +1,28 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bb8::Pool;
 use bb8_tiberius::ConnectionManager;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use tiberius::{AuthMethod, Config};
+use tracing::{info, warn};
 
 use crate::config::MssqlConfig;
 use crate::lims::model::LimsJob;
 use crate::lims::repository::LimsRepository;
+
+/// Tables + key columns the LIMS query depends on. Checked at startup so a
+/// schema mismatch is reported loudly before any request is made.
+const EXPECTED_SCHEMA: &[(&str, &[&str])] = &[
+    ("Entity", &["pkGlobalEntityID", "EntityTypeID", "DisplayName"]),
+    (
+        "EntityLinks",
+        &["RelatedEntityID", "fkEntityRelationshipID", "EntityID"],
+    ),
+    ("JobRecipeView", &["pkID", "JobNumber"]),
+    ("Job6Custom", &["JobNumber", "Type", "XTime", "Status"]),
+];
 
 /// The user's LIMS query, verbatim T-SQL — the single source of truth. Compiled
 /// in and executed unmodified, so pointing at the real LIMS needs only a new
@@ -25,8 +40,14 @@ impl TiberiusLimsRepository {
         config.port(cfg.port);
         config.database(&cfg.database);
         config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
+        // TLS verification (trust_cert and trust_cert_ca are mutually exclusive):
+        //   trust_cert = true  -> accept any server cert (encrypted, NOT verified)
+        //   MSSQL_CA_CERT set   -> verify against this CA (e.g. an internal CA)
+        //   neither             -> verify against the system trust store (public CAs)
         if cfg.trust_cert {
             config.trust_cert();
+        } else if let Some(ca) = &cfg.ca_cert_path {
+            config.trust_cert_ca(ca.as_str());
         }
 
         let manager = ConnectionManager::new(config);
@@ -40,8 +61,96 @@ impl TiberiusLimsRepository {
         pool.get()
             .await
             .context("connecting to mssql at startup")?;
+        info!(
+            host = %cfg.host,
+            port = cfg.port,
+            database = %cfg.database,
+            user = %cfg.user,
+            "connected to LIMS (SQL Server)"
+        );
+
+        // Report whether the query's tables/columns exist in this schema.
+        preflight_schema(&pool).await;
 
         Ok(Self { pool })
+    }
+}
+
+/// Check `INFORMATION_SCHEMA` for every table/column the LIMS query needs and
+/// log a clear pass/fail report. Non-fatal — it only diagnoses. A missing table
+/// or column here explains a query that errors or returns nothing.
+async fn preflight_schema(pool: &Pool<ConnectionManager>) {
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = format!("{e:#}"), "schema preflight skipped: no connection");
+            return;
+        }
+    };
+
+    let sql = "SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+               WHERE TABLE_NAME IN ('Entity','EntityLinks','JobRecipeView','Job6Custom')";
+    let rows = match conn.simple_query(sql).await {
+        Ok(s) => match s.into_first_result().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = format!("{e:#}"), "schema preflight query failed");
+                return;
+            }
+        },
+        Err(e) => {
+            warn!(error = format!("{e:#}"), "schema preflight query failed");
+            return;
+        }
+    };
+
+    // Set of "table.column" (lowercased) actually present in the LIMS.
+    let mut present: HashSet<String> = HashSet::new();
+    let mut tables: HashSet<String> = HashSet::new();
+    for row in &rows {
+        let t: Option<&str> = row.get("TABLE_NAME");
+        let c: Option<&str> = row.get("COLUMN_NAME");
+        if let (Some(t), Some(c)) = (t, c) {
+            tables.insert(t.to_lowercase());
+            present.insert(format!("{}.{}", t.to_lowercase(), c.to_lowercase()));
+        }
+    }
+
+    let mut problems = 0;
+    for (table, cols) in EXPECTED_SCHEMA {
+        if !tables.contains(&table.to_lowercase()) {
+            problems += 1;
+            warn!(
+                table = *table,
+                "LIMS schema check: table NOT FOUND (missing, or the login lacks permission to see it)"
+            );
+            continue;
+        }
+        let missing: Vec<&str> = cols
+            .iter()
+            .copied()
+            .filter(|c| !present.contains(&format!("{}.{}", table.to_lowercase(), c.to_lowercase())))
+            .collect();
+        if missing.is_empty() {
+            info!(table = *table, "LIMS schema check: OK");
+        } else {
+            problems += 1;
+            warn!(
+                table = *table,
+                missing_columns = missing.join(", "),
+                "LIMS schema check: table present but columns MISSING"
+            );
+        }
+    }
+
+    if problems == 0 {
+        info!("LIMS schema check: all expected tables and columns present");
+    } else {
+        warn!(
+            issues = problems,
+            "LIMS schema check found {problems} issue(s) — the query in sql/lims_jobs.sql \
+             likely needs adapting to this LIMS's schema (see warnings above)"
+        );
     }
 }
 
@@ -64,7 +173,22 @@ impl LimsRepository for TiberiusLimsRepository {
             .await
             .context("collecting LIMS rows")?;
 
-        rows.iter().map(row_to_job).collect()
+        let jobs: Vec<LimsJob> = rows
+            .iter()
+            .map(row_to_job)
+            .collect::<Result<_>>()
+            .context("mapping LIMS rows (column alias mismatch?)")?;
+
+        if jobs.is_empty() {
+            warn!(
+                "LIMS query returned 0 rows — connection + schema are fine but nothing matched. \
+                 Check the filters in sql/lims_jobs.sql (Status IN ('A','P'), Type = 'SEM') and \
+                 the entity-type / relationship IDs against this LIMS's data."
+            );
+        } else {
+            info!(count = jobs.len(), "LIMS query returned {} job(s)", jobs.len());
+        }
+        Ok(jobs)
     }
 
     async fn get_job(&self, job_number: &str) -> Result<Option<LimsJob>> {

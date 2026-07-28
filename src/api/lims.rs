@@ -18,7 +18,10 @@ pub fn router() -> Router<AppState> {
 /// GET /api/lims/jobs — runs the LIMS query and returns the open SEM jobs.
 async fn list_jobs(State(state): State<AppState>) -> ApiResult<Vec<LimsJob>> {
     let jobs = state.lims.list_jobs().await.map_err(|e| {
-        error_response(StatusCode::BAD_GATEWAY, format!("LIMS query failed: {e}"))
+        // `{e:#}` prints the full anyhow chain incl. the underlying SQL Server
+        // error (e.g. "Invalid object name 'Job6Custom'"), not just the top layer.
+        tracing::error!("GET /api/lims/jobs failed: {e:#}");
+        error_response(StatusCode::BAD_GATEWAY, format!("LIMS query failed: {e:#}"))
     })?;
     Ok((StatusCode::OK, Json(jobs)))
 }
@@ -32,7 +35,10 @@ async fn get_job(
         .lims
         .get_job(&job_number)
         .await
-        .map_err(|e| error_response(StatusCode::BAD_GATEWAY, format!("LIMS query failed: {e}")))?
+        .map_err(|e| {
+            tracing::error!("GET /api/lims/jobs/{job_number} failed: {e:#}");
+            error_response(StatusCode::BAD_GATEWAY, format!("LIMS query failed: {e:#}"))
+        })?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Job not found"))?;
     Ok((StatusCode::OK, Json(job)))
 }
