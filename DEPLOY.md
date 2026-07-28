@@ -141,6 +141,42 @@ docker compose up -d --build adapter   # rebuild + restart just the adapter
 docker compose down                    # stop everything (add -v to wipe the DB volume)
 ```
 
+## Diagnosing LIMS / DB issues
+
+Read the adapter logs — that's where every DB step is reported:
+
+```bash
+docker compose logs -f adapter
+```
+Make sure logging is on (default is fine, but explicit is safest): set `RUST_LOG=info`
+in `adapter.env`.
+
+**Healthy startup + a request looks like this:**
+```
+INFO  connected to LIMS (SQL Server)  host=... port=1433 database=LIMS user=...
+INFO  LIMS schema check: OK  table="Entity"        (…EntityLinks, JobRecipeView, Job6Custom)
+INFO  LIMS schema check: all expected tables and columns present
+INFO  LIMS query returned 64 job(s)  count=64      ← logged on every /api/lims/jobs call
+```
+
+**Triage table** — find the log line you see and what it means:
+
+| Log line | Meaning | Fix |
+|---|---|---|
+| `connected to LIMS (SQL Server)` then `schema check: OK` … `returned N job(s)` | All good. | — |
+| `LIMS query returned 0 rows — connection + schema are fine but nothing matched…` | Connected, schema exists, but the query's **filters** matched nothing. | Check `Status IN ('A','P')`, `Type = 'SEM'`, and the entity-type/relationship IDs in `sql/lims_jobs.sql` against the customer's data. |
+| `LIMS schema check: table NOT FOUND … table="Job6Custom"` | That **table/view doesn't exist** (or the login can't see it). | The customer's schema differs, or the login lacks `SELECT`. Adapt `sql/lims_jobs.sql`, or grant permission. |
+| `LIMS schema check: table present but columns MISSING … missing_columns="XTime, Status"` | Table exists but a **column was renamed/removed**. | Update the column names in `sql/lims_jobs.sql`. |
+| `GET /api/lims/jobs failed: … Invalid object name 'Job6Custom'` (or other SQL error) | The query **ran and errored** — the full SQL Server message is shown. | Act on the specific SQL error (bad object/column/syntax for this schema). |
+| `Could not connect to the LIMS as SQL Server: … NOTE: this adapter speaks ONLY Microsoft SQL Server …` | **Can't connect at all** — wrong host/port, firewall, bad login, or **the DB isn't SQL Server** (e.g. PostgreSQL/MySQL). | Verify host/port/login/firewall. If the LIMS is a different engine, that needs a new `LimsRepository` implementation (a code change), not just config. |
+
+Notes:
+- The **schema check runs once at startup**; the **row-count logs on every request** (the UI
+  polls `/api/lims/jobs` ~every 5 s, so you'll see `returned N job(s)` repeatedly).
+- Errors are also returned to the UI in the API response body (`{"error": "LIMS query failed: …"}`),
+  so a failed lookup shows the reason on screen too.
+- Quick manual check from the host: `curl http://localhost:7900/api/lims/jobs`.
+
 ## Notes
 
 - Change host ports in `docker-compose.yaml` if 8080 / 7900 are taken

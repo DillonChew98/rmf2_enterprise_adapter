@@ -37,7 +37,22 @@ async fn main() -> anyhow::Result<()> {
                 database = %cfg.mssql.database,
                 "LIMS backend: tiberius (SQL Server)"
             );
-            Arc::new(TiberiusLimsRepository::connect(&cfg.mssql).await?)
+            let repo = TiberiusLimsRepository::connect(&cfg.mssql)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        host = %cfg.mssql.host,
+                        port = cfg.mssql.port,
+                        "Could not connect to the LIMS as SQL Server: {e:#}. \
+                         Check host/port, the login, and the firewall. NOTE: this adapter \
+                         speaks ONLY Microsoft SQL Server (TDS protocol). If the LIMS is \
+                         actually PostgreSQL, MySQL, Oracle, etc., it cannot connect here — \
+                         that requires a different LimsRepository implementation (a code \
+                         change), not just new settings.",
+                    );
+                    e
+                })?;
+            Arc::new(repo)
         }
     };
 
