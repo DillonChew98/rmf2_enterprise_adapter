@@ -8,11 +8,23 @@ pub enum LimsBackend {
     Mock,
 }
 
+/// How the adapter authenticates to SQL Server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MssqlAuth {
+    /// SQL Server login: username + password (works on any platform).
+    Sql,
+    /// Windows Integrated Auth as the account the process runs under (SSPI).
+    /// Only available in a Windows build; the adapter must run as the domain
+    /// service account. No username/password stored.
+    Integrated,
+}
+
 #[derive(Clone, Debug)]
 pub struct MssqlConfig {
     pub host: String,
     pub port: u16,
     pub database: String,
+    pub auth: MssqlAuth,
     pub user: String,
     pub password: String,
     pub trust_cert: bool,
@@ -58,6 +70,16 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1433),
             database: env::var("MSSQL_DATABASE").unwrap_or_else(|_| "LIMS".to_string()),
+            // "sql" (default) = username/password; "integrated"/"windows" = SSPI
+            // as the process's Windows account (Windows build only).
+            auth: match env::var("MSSQL_AUTH")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str()
+            {
+                "integrated" | "windows" => MssqlAuth::Integrated,
+                _ => MssqlAuth::Sql,
+            },
             user: env::var("MSSQL_USER").unwrap_or_else(|_| "sa".to_string()),
             password: env::var("MSSQL_PASSWORD")
                 .unwrap_or_else(|_| "Your_strong_Pass123".to_string()),

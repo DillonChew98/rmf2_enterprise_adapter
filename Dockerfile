@@ -4,6 +4,17 @@
 # edition 2024 needs a recent toolchain; rust:1-slim tracks the latest stable.
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
+
+# Optional corporate CA — only needed behind a TLS-inspecting proxy where cargo
+# can't verify crates.io. Drop the PEM as `corp-ca.pem` in the build context and
+# it's trusted; without it the build is unchanged. Appended to the system CA
+# bundle that cargo/git/https read by default (handles multi-cert bundles; no env
+# var to dangle).
+COPY corp-ca.pe[m] /tmp/
+RUN if [ -f /tmp/corp-ca.pem ]; then \
+        cat /tmp/corp-ca.pem >> /etc/ssl/certs/ca-certificates.crt; \
+    fi
+
 # Copy the crate (lib + both bins) and the SQL that tiberius_repo compiles in
 # via include_str!("../../sql/lims_jobs.sql").
 COPY Cargo.toml Cargo.lock ./

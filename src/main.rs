@@ -7,7 +7,7 @@ use tracing::info;
 use rmf2_enterprise_adapter::api::{self, ApiResult};
 use rmf2_enterprise_adapter::catalog::catalog::ChemicalCatalog;
 use rmf2_enterprise_adapter::catalog::static_catalog::StaticChemicalCatalog;
-use rmf2_enterprise_adapter::config::{Config, LimsBackend};
+use rmf2_enterprise_adapter::config::{Config, LimsBackend, MssqlAuth};
 use rmf2_enterprise_adapter::device::device::Device;
 use rmf2_enterprise_adapter::device::mqtt_device::MqttDevice;
 use rmf2_enterprise_adapter::jobs::memory_store::MemoryJobStore;
@@ -31,10 +31,15 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(MockLimsRepository::new())
         }
         LimsBackend::Tiberius => {
+            let auth = match cfg.mssql.auth {
+                MssqlAuth::Sql => "sql (login)",
+                MssqlAuth::Integrated => "integrated (Windows)",
+            };
             info!(
                 host = %cfg.mssql.host,
                 port = cfg.mssql.port,
                 database = %cfg.mssql.database,
+                auth,
                 "LIMS backend: tiberius (SQL Server)"
             );
             let repo = TiberiusLimsRepository::connect(&cfg.mssql)

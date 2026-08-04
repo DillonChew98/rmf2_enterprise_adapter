@@ -8,3 +8,7 @@ mix_presets.json
 # TLS certs supplied per-site — keep the folder + its README, ignore the certs.
 certs/*
 !certs/README.md
+
+# Optional corporate build-proxy CA (Docker build context) — per-site, never commit.
+corp-ca.pem
+modules/enterprise-ui/corp-ca.pem

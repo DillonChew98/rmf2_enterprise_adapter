@@ -68,6 +68,70 @@ compose service names), so it works out of the box.
 > container restarts until it is (a few seconds). `restart: unless-stopped`
 > handles this automatically.
 
+## Building behind a corporate proxy (TLS interception)
+
+On a locked-down corporate network, a TLS-inspecting proxy re-signs HTTPS with an
+**internal CA**. Inside the build containers that CA isn't trusted, so `cargo`
+(crates.io) and `npm` (the registry) fail with errors like
+`SSL peer certificate ... was not ok`. To fix it, supply the corporate CA to the
+builds.
+
+1. **Get the corporate root CA** as a PEM file (from IT, or exported from the
+   Windows cert store / browser). Any filename is fine — you'll rename a copy.
+
+2. **Place a copy named `corp-ca.pem` in BOTH build contexts** (the adapter and
+   the UI are built separately, so it goes in two places):
+
+   ```
+   corp-ca.pem                        # repo root      -> adapter build
+   modules/enterprise-ui/corp-ca.pem  # UI build context
+   ```
+
+   On Windows PowerShell, from the repo root (renaming a copy — the file's
+   contents/certs are unchanged, only the name):
+
+   ```powershell
+   copy your-corp-bundle.pem corp-ca.pem
+   copy your-corp-bundle.pem modules\enterprise-ui\corp-ca.pem
+   ```
+
+3. **Build normally:**
+   ```bash
+   docker compose build
+   ```
+   The adapter build appends the CA to its system trust store (cargo trusts it);
+   the UI build points `NODE_EXTRA_CA_CERTS` at it (npm trusts it).
+
+Notes:
+- The file name **must be** `corp-ca.pem` — that's what the Dockerfiles look for.
+- It's **optional**: with no `corp-ca.pem` present the builds are unchanged, so
+  the same repo builds fine on an open network.
+- `corp-ca.pem` is **git-ignored** — it's a per-site file, never committed.
+- This CA is only for the **build** (reaching crates.io / npm through the proxy).
+  It is unrelated to the **database** TLS, which is the separate
+  `MSSQL_TRUST_CERT` / `MSSQL_CA_CERT` settings above.
+- If the target machine itself can't reach registries, build the images on a
+  machine that can and ship them (see "Air-gapped / offline install" below) —
+  then the target needs neither the CA nor registry access.
+
+## Air-gapped / offline install (build elsewhere, ship images)
+
+For a target with no registry/internet access, build on a machine that has access
+(with the corporate CA if needed), export the images to a file, and load them on
+the target — no build, no registries, no CA needed on the target:
+
+```bash
+# On a machine that can build:
+docker compose build
+docker save rmf2-enterprise-adapter:latest rmf2-enterprise-ui:latest \
+            mcr.microsoft.com/mssql/server:2022-latest eclipse-mosquitto:2 \
+            -o rmf2-images.tar        # drop the last two if not using the demo
+
+# Copy rmf2-images.tar + docker-compose.yaml + adapter.env to the target, then:
+docker load -i rmf2-images.tar
+docker compose up -d                  # runs the loaded images; nothing to pull
+```
+
 ## Running on Windows (Windows 11 LTSC / Windows Server)
 
 The whole stack runs on Windows with Docker — the images are Linux-based and run
@@ -130,6 +194,64 @@ handles permissions.
   netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=(wsl hostname -I)
   ```
   (Docker Desktop does this for you — nothing extra needed.)
+
+## Building the adapter as a native Windows executable (for Windows Integrated Auth)
+
+Only needed if the LIMS requires **Windows Integrated Authentication**
+(`MSSQL_AUTH=integrated`) — the containerized (Linux) adapter can't use it, so the
+adapter runs as a **native Windows service** under a domain account instead. (If
+you have a **SQL login**, skip all of this — keep the Docker container and set
+`MSSQL_AUTH=sql`.)
+
+You build the `.exe` **once on any Windows machine** with Rust — NOT on the target.
+The target then needs only the `.exe`, no toolchain.
+
+1. **Install Rust (on the build machine, one-time)** — from rustup.rs, or:
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+   Uses the MSVC toolchain by default; if prompted, allow the Visual Studio C++
+   Build Tools (the one prerequisite). Verify: `rustc --version`.
+
+2. **Get the source** onto the build machine (`git clone`/`pull`, or copy the
+   folder — needs `Cargo.toml`, `Cargo.lock`, `src/`, `sql/`, `chemicals.txt`).
+
+3. **Behind the corporate proxy?** Point cargo at the CA first:
+   ```powershell
+   $env:CARGO_HTTP_CAINFO = "C:\path\to\corp-ca.pem"
+   ```
+
+4. **Build (release):**
+   ```powershell
+   cargo build --release --bin rmf2_enterprise_adapter
+   ```
+   Output: `target\release\rmf2_enterprise_adapter.exe`.
+
+5. **Copy the `.exe` to the target** and register it as a Windows service running
+   **as the domain service account** (so integrated auth works). Using NSSM:
+   ```powershell
+   nssm install rmf2-adapter "C:\rmf2\rmf2_enterprise_adapter.exe"
+   nssm set rmf2-adapter AppDirectory "C:\rmf2"
+   nssm set rmf2-adapter AppEnvironmentExtra LIMS_BACKEND=tiberius MSSQL_HOST=<server> MSSQL_PORT=<port> MSSQL_DATABASE=<db> MSSQL_AUTH=integrated BIND_ADDR=0.0.0.0:7900 MQTT_HOST=<broker>
+   nssm set rmf2-adapter ObjectName "DOMAIN\svc_account" "<account password entered once>"
+   nssm start rmf2-adapter
+   ```
+   The service authenticates to SQL Server **as that account** — no
+   username/password in any file (`MSSQL_USER`/`MSSQL_PASSWORD` are ignored under
+   `integrated`). Logs can be redirected to a file via NSSM; manage it in
+   `services.msc`.
+
+6. **Point the UI at the native adapter.** The UI (still in Docker) proxies `/api`
+   to the adapter — change the proxy target in `modules/enterprise-ui/nginx.conf`
+   from `adapter:7900` to `host.docker.internal:7900`, rebuild the UI image, and
+   open Windows Firewall inbound on **7900**.
+
+Notes:
+- Running the `.exe` directly in a terminal shows a console window with the logs
+  (good for a quick test; `Ctrl+C` stops it). As a **service** it runs headless in
+  the background, auto-starts on boot, and needs no logged-in user.
+- What IT must provide for this route: a **domain service account** with "log on
+  as a service" rights and read access to the LIMS DB — no SQL login, no keytab.
 
 ## Common commands
 

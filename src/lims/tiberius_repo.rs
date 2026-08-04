@@ -8,7 +8,7 @@ use chrono::{NaiveDateTime, TimeZone, Utc};
 use tiberius::{AuthMethod, Config};
 use tracing::{info, warn};
 
-use crate::config::MssqlConfig;
+use crate::config::{MssqlAuth, MssqlConfig};
 use crate::lims::model::LimsJob;
 use crate::lims::repository::LimsRepository;
 
@@ -39,7 +39,30 @@ impl TiberiusLimsRepository {
         config.host(&cfg.host);
         config.port(cfg.port);
         config.database(&cfg.database);
-        config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
+        // Authentication:
+        //   Sql        -> username/password (any platform).
+        //   Integrated -> SSPI as the process's Windows account (Windows build
+        //                 only). Run the adapter as the domain service account;
+        //                 no username/password is used or stored.
+        match cfg.auth {
+            MssqlAuth::Sql => {
+                config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
+            }
+            MssqlAuth::Integrated => {
+                #[cfg(windows)]
+                {
+                    config.authentication(AuthMethod::Integrated);
+                }
+                #[cfg(not(windows))]
+                {
+                    anyhow::bail!(
+                        "MSSQL_AUTH=integrated (Windows Integrated Auth) requires a Windows \
+                         build running as the domain service account. This is a non-Windows \
+                         build — use MSSQL_AUTH=sql with a SQL Server login instead."
+                    );
+                }
+            }
+        }
         // TLS verification (trust_cert and trust_cert_ca are mutually exclusive):
         //   trust_cert = true  -> accept any server cert (encrypted, NOT verified)
         //   MSSQL_CA_CERT set   -> verify against this CA (e.g. an internal CA)
