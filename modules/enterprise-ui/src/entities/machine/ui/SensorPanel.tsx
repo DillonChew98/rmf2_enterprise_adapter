@@ -1,20 +1,19 @@
 import { Card } from "@/shared/ui/Card";
 import { StatusBadge, type StatusTone } from "@/shared/ui/StatusBadge";
-import type { Sensor, SensorStatus } from "../model/types";
+import type { Sensor } from "../model/types";
 
 // Sensors are shown as a simple On/Off indicator.
-const tone: Record<SensorStatus, StatusTone> = {
-  OK: "ok",
-  TRIGGERED: "ok",
-  FAULT: "danger",
-  OFFLINE: "neutral",
+// sensor status: 1=OK, 2=FAULT, 3=OFFLINE
+const tone: Record<number, StatusTone> = {
+  1: "ok",
+  2: "danger",
+  3: "neutral",
 };
 
-const label: Record<SensorStatus, string> = {
-  OK: "On",
-  TRIGGERED: "On",
-  FAULT: "Off",
-  OFFLINE: "Off",
+const label: Record<number, string> = {
+  1: "On",
+  2: "Off",
+  3: "Off",
 };
 
 export function SensorPanel({ sensors }: { sensors: Sensor[] }) {
@@ -32,7 +31,10 @@ export function SensorPanel({ sensors }: { sensors: Sensor[] }) {
                 </p>
               )}
             </div>
-            <StatusBadge tone={tone[s.status]} label={label[s.status]} />
+            <StatusBadge
+              tone={tone[s.status] ?? "neutral"}
+              label={label[s.status] ?? "Off"}
+            />
           </li>
         ))}
       </ul>

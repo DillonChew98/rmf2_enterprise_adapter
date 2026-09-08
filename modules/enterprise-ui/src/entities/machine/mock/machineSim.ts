@@ -8,37 +8,64 @@ import type {
 // In-browser simulation of the delayering machine. A module-level interval
 // advances a mutable snapshot once a second so the Dashboard's polling shows
 // live movement. Swapped out wholesale when VITE_USE_MOCK=false.
+//
+// The machine interface uses NUMERIC codes on the wire:
+//   systemStatus:  1=IDLE, 2=RUNNING, 3=ERROR, 4=OFFLINE
+//   step status:   1=PENDING, 2=ACTIVE, 3=DONE
+//   sensor status: 1=OK, 2=FAULT, 3=OFFLINE
+//   connection:    1=ONLINE, 2=OFFLINE, 3=CONNECTION_BROKEN
+//   method:        1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE
 
 interface RecipeStep {
-  chemical: string;
-  method: string;
-  duration: string; // formatted incl. unit
+  mode: number; // 1=single, 2=mix
+  chemical: number; // 0 for a mix (chemical code otherwise)
+  components: { chemical: number; percent: number }[]; // [] for a single chemical
+  method: number; // 1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE
+  durationSec: number;
 }
 
+// Chemical codes (fixed catalog): 1=HNO3, 2=HF, 3=HCl, 4=MAE, 5=BOE, 6=Choline.
 // Per-job chemical recipes the machine works through. Modelled on the real
 // delayering processes (BOE, mixes, poly etch, HF + ultrasonic, choline).
+// Convenience builders keep each recipe step readable.
+function single(chemical: number, method: number, durationSec: number): RecipeStep {
+  return { mode: 1, chemical, components: [], method, durationSec };
+}
+function mix(
+  components: { chemical: number; percent: number }[],
+  method: number,
+  durationSec: number
+): RecipeStep {
+  return { mode: 2, chemical: 0, components, method, durationSec };
+}
+
+const HCL_HNO3 = [
+  { chemical: 3, percent: 50 }, // HCl
+  { chemical: 1, percent: 50 }, // HNO3
+];
+
 const RECIPES: Record<string, RecipeStep[]> = {
   "J-100482": [
-    { chemical: "BOE", method: "NIL", duration: "2/1.5/1 min" },
-    { chemical: "1:1 HCl+HNO3", method: "NIL", duration: "1 min" },
+    single(5, 1, 270), // BOE
+    mix(HCL_HNO3, 1, 60),
   ],
   "J-100483": [
-    { chemical: "Poly etch (MAE)", method: "NIL", duration: "4 min" },
-    { chemical: "HF", method: "Ultrasonic", duration: "5 sec" },
+    single(4, 1, 240), // MAE (poly etch)
+    single(2, 2, 5), // HF
   ],
   "J-100484": [
-    { chemical: "Choline hydroxide", method: "Heated plate", duration: "20-40 min" },
+    single(6, 3, 1800), // Choline
   ],
   "J-100485": [
-    { chemical: "HF", method: "Ultrasonic", duration: "5 sec" },
-    { chemical: "1:1 HCl+HNO3", method: "NIL", duration: "1 min" },
-    { chemical: "BOE", method: "NIL", duration: "2/1.5/1 min" },
+    single(2, 2, 5), // HF
+    mix(HCL_HNO3, 1, 60),
+    single(5, 1, 270), // BOE
   ],
 };
 
 const JOB_QUEUE = Object.keys(RECIPES);
 const PROCESS_TARGET = 60; // seconds of active chemistry per job
-const CLEAN_TARGET = 78; // cycle second at which beaker cleaning finishes
+const CLEAN_TARGET = 78; // cycle second at which the job fully finishes
 
 // Build the step list with one ACTIVE step (or all DONE when finished/idle).
 function buildSteps(recipe: RecipeStep[], activeIndex: number | null): JobProcessStep[] {
@@ -46,192 +73,132 @@ function buildSteps(recipe: RecipeStep[], activeIndex: number | null): JobProces
     ...s,
     status:
       activeIndex === null || i < activeIndex
-        ? "DONE"
+        ? 3 // DONE
         : i === activeIndex
-          ? "ACTIVE"
-          : "PENDING",
+          ? 2 // ACTIVE
+          : 1, // PENDING
   }));
 }
 
 function baseSensors(): Sensor[] {
   return [
-    { id: "ultrasonic_unit", name: "Ultrasonic Overflow Sensor", status: "OK" },
-    { id: "leak_detector", name: "Leak Detection Sensor", status: "OK" },
+    { id: "ultrasonic_unit", name: "Ultrasonic Overflow Sensor", status: 1 },
+    { id: "leak_detector", name: "Leak Detection Sensor", status: 1 },
   ];
 }
 
+// Internal simulation state — NOT part of the published MachineState.
 let jobIndex = 0;
 let errorTicksLeft = 0;
 let currentRecipe: RecipeStep[] = [];
+let cycleTimeSec = 0;
+let processing = false; // true while actively running chemistry (pre-finish)
 
 const state: MachineState = {
-  systemStatus: "IDLE",
-  currentJob: null,
-  currentJobSteps: [],
-  lastCompletedJob: null,
-  lastCompletedSteps: [],
-  lastCompletedAt: null,
-  completedJobs: [],
-  cycleTimeSec: 0,
+  systemStatus: 1, // IDLE
+  currentJobs: [],
+  lastCompleted: [],
   errorCode: null,
-  chemicalLevelStatus: "OK",
-  processComplete: "NOT_STARTED",
-  beakerCleaningStatus: "IDLE",
-  alarmTriggered: false,
-  alarmMessage: null,
   sensors: baseSensors(),
   chemicalStorage: [85, 62, 48, 33, 18, 8, 0, 55],
-  beakerChemicals: [
-    "BOE",
-    "50%HCL; 50%HNO3",
-    "MAE",
-    "HF",
-    "",
-    "",
-    "HF",
-    "Choline hydroxide",
-  ],
-  jobDateTime: null,
-  updatedAt: new Date().toISOString(),
 };
 
 const connection: MachineConnection = {
-  status: "ONLINE",
+  status: 1, // ONLINE
   receivedAt: new Date().toISOString(),
 };
 
-function sensor(id: string): Sensor | undefined {
-  return state.sensors.find((s) => s.id === id);
-}
-
 function setSensor(id: string, patch: Partial<Sensor>): void {
-  const s = sensor(id);
+  const s = state.sensors.find((x) => x.id === id);
   if (s) Object.assign(s, patch);
 }
 
 function startNextJob(): void {
   const jobNumber = JOB_QUEUE[jobIndex % JOB_QUEUE.length] ?? null;
   jobIndex += 1;
-  state.currentJob = jobNumber;
   currentRecipe = jobNumber ? RECIPES[jobNumber] ?? [] : [];
-  state.currentJobSteps = buildSteps(currentRecipe, 0);
-  state.systemStatus = "RUNNING";
-  state.cycleTimeSec = 0;
-  state.processComplete = "IN_PROGRESS";
-  state.beakerCleaningStatus = "IDLE";
+  // The mock runs one job at a time; the field is a list so the real machine
+  // can report several concurrent jobs.
+  state.currentJobs = jobNumber
+    ? [{ jobOrder: "", port: String((jobIndex % 4) + 1), jobNumber, steps: buildSteps(currentRecipe, 0) }]
+    : [];
+  state.systemStatus = 2; // RUNNING
+  cycleTimeSec = 0;
+  processing = true;
   state.errorCode = null;
-  state.alarmTriggered = false;
-  state.alarmMessage = null;
-  state.chemicalLevelStatus = "OK";
   state.sensors = baseSensors();
-  setSensor("dispense_flow", { value: 1.4 });
-  setSensor("bath_temp", { value: 55 });
-  state.jobDateTime = new Date().toISOString();
 }
 
 function enterError(): void {
   errorTicksLeft = 8;
-  state.systemStatus = "ERROR";
+  state.systemStatus = 3; // ERROR
   state.errorCode = "E-204";
-  state.alarmTriggered = true;
-  state.alarmMessage = "Dispense over-pressure — chemistry paused";
-  setSensor("leak_detector", { status: "TRIGGERED" });
-  setSensor("dispense_flow", { value: 0, status: "FAULT" });
+  setSensor("leak_detector", { status: 2 }); // FAULT
 }
 
 function clearError(): void {
-  state.systemStatus = "RUNNING";
+  state.systemStatus = 2; // RUNNING
   state.errorCode = null;
-  state.alarmTriggered = false;
-  state.alarmMessage = null;
-  setSensor("leak_detector", { status: "OK" });
-  setSensor("dispense_flow", { value: 1.4, status: "OK" });
+  setSensor("leak_detector", { status: 1 }); // OK
 }
 
 function tick(): void {
-  if (state.systemStatus === "ERROR") {
+  if (state.systemStatus === 3) {
+    // ERROR
     errorTicksLeft -= 1;
     if (errorTicksLeft <= 0) clearError();
-    state.updatedAt = new Date().toISOString();
     return;
   }
 
-  if (state.systemStatus === "IDLE") {
-    // Brief idle pause, then pick up the next queued job.
-    if (state.cycleTimeSec >= 5) {
-      startNextJob();
-    } else {
-      state.cycleTimeSec += 1;
-    }
-    state.updatedAt = new Date().toISOString();
+  if (state.systemStatus === 1) {
+    // IDLE — brief idle pause, then pick up the next queued job.
+    if (cycleTimeSec >= 5) startNextJob();
+    else cycleTimeSec += 1;
     return;
   }
 
   // RUNNING
-  state.cycleTimeSec += 1;
+  cycleTimeSec += 1;
 
   // Chemical storage drains only while a job runs.
-  state.chemicalStorage = state.chemicalStorage.map((l) =>
-    Math.max(0, l - 0.8)
-  );
+  state.chemicalStorage = state.chemicalStorage.map((l) => Math.max(0, l - 0.8));
 
   // Occasional fault while actively processing.
-  if (state.processComplete === "IN_PROGRESS" && Math.random() < 0.03) {
+  if (processing && Math.random() < 0.03) {
     enterError();
-    state.updatedAt = new Date().toISOString();
     return;
   }
 
+  const job = state.currentJobs[0];
+
   // Advance the active chemical step across the processing window.
-  if (state.processComplete === "IN_PROGRESS" && currentRecipe.length > 0) {
+  if (processing && currentRecipe.length > 0 && job) {
     const perStep = PROCESS_TARGET / currentRecipe.length;
     const idx = Math.min(
       currentRecipe.length - 1,
-      Math.floor(state.cycleTimeSec / perStep)
+      Math.floor(cycleTimeSec / perStep)
     );
-    state.currentJobSteps = buildSteps(currentRecipe, idx);
+    job.steps = buildSteps(currentRecipe, idx);
   }
 
-  // Chemical level drains and bath temperature drifts during processing.
-  const lvl = sensor("chem_level");
-  if (lvl && typeof lvl.value === "number" && state.processComplete === "IN_PROGRESS") {
-    lvl.value = Math.max(0, lvl.value - 1.3);
-    state.chemicalLevelStatus =
-      lvl.value > 40 ? "OK" : lvl.value > 15 ? "LOW" : lvl.value > 0 ? "CRITICAL" : "EMPTY";
-    if (state.chemicalLevelStatus === "CRITICAL") {
-      state.alarmTriggered = true;
-      state.alarmMessage = "Chemical level critical";
-    }
+  if (cycleTimeSec >= PROCESS_TARGET && processing) {
+    processing = false;
+    if (job) job.steps = buildSteps(currentRecipe, null);
   }
 
-  if (state.cycleTimeSec >= PROCESS_TARGET && state.processComplete === "IN_PROGRESS") {
-    state.processComplete = "COMPLETE";
-    state.beakerCleaningStatus = "CLEANING";
-    state.currentJobSteps = buildSteps(currentRecipe, null);
-    setSensor("dispense_flow", { value: 0 });
-  }
-
-  if (state.processComplete === "COMPLETE" && state.cycleTimeSec >= CLEAN_TARGET) {
-    state.beakerCleaningStatus = "COMPLETE";
-    state.systemStatus = "IDLE";
-    state.cycleTimeSec = 0;
+  if (!processing && cycleTimeSec >= CLEAN_TARGET) {
+    state.systemStatus = 1; // IDLE
+    cycleTimeSec = 0;
     // Record the finished job so the Pushed Job List can mark it COMPLETED.
-    if (state.currentJob) {
-      state.lastCompletedJob = state.currentJob;
-      state.lastCompletedAt = new Date().toISOString();
-      state.completedJobs = [
-        state.currentJob,
-        ...state.completedJobs.filter((n) => n !== state.currentJob),
-      ].slice(0, 100);
+    if (job) {
+      state.lastCompleted = [
+        { ...job, at: new Date().toISOString() },
+        ...state.lastCompleted,
+      ].slice(0, 200);
     }
-    state.currentJob = null;
-    state.currentJobSteps = [];
+    state.currentJobs = [];
     currentRecipe = [];
-    state.jobDateTime = null;
-    state.processComplete = "NOT_STARTED";
   }
-
-  state.updatedAt = new Date().toISOString();
 }
 
 let started = false;
@@ -248,9 +215,15 @@ export function getMockMachineState(): MachineState {
   return {
     ...state,
     sensors: state.sensors.map((s) => ({ ...s })),
-    currentJobSteps: state.currentJobSteps.map((s) => ({ ...s })),
+    currentJobs: state.currentJobs.map((j) => ({
+      ...j,
+      steps: j.steps.map((s) => ({ ...s })),
+    })),
+    lastCompleted: state.lastCompleted.map((c) => ({
+      ...c,
+      steps: c.steps.map((s) => ({ ...s })),
+    })),
     chemicalStorage: [...state.chemicalStorage],
-    completedJobs: [...state.completedJobs],
   };
 }
 

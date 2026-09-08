@@ -10,5 +10,6 @@ export async function listChemicals(): Promise<Chemical[]> {
 }
 
 export function toChemicalOptions(chemicals: Chemical[]): SelectOption[] {
-  return chemicals.map((c) => ({ value: c.name, label: c.name }));
+  // value is the stringified numeric code so the dropdown stores the code.
+  return chemicals.map((c) => ({ value: String(c.code), label: c.name }));
 }

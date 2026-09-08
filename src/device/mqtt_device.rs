@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::config::MqttConfig;
 use crate::device::device::{Device, SubmitOutcome};
 use crate::device::model::{
-    ConnectionPayload, ConnectionStatus, MachineConnection, MachineState, MixPreset, SystemStatus,
+    ConnectionPayload, ConnectionStatus, MachineConnection, MachineState, MixPreset,
 };
 use crate::device::topics::MachineTopics;
 use crate::jobs::model::DelayeringJobRequest;
@@ -21,7 +21,7 @@ const STALE_SECS: i64 = 15;
 #[derive(Default)]
 struct Cache {
     state: Option<MachineState>,
-    conn_state: Option<String>,
+    conn_state: Option<i64>, // 1=ONLINE, 2=OFFLINE
     conn_at: Option<DateTime<Utc>>,
     presets: Vec<MixPreset>,
 }
@@ -53,10 +53,10 @@ impl MqttDevice {
             loop {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                        for topic in [&sub_topics.state, &sub_topics.connection, &sub_topics.mixes] {
+                        for topic in [&sub_topics.state, &sub_topics.connection, &sub_topics.recipes] {
                             let _ = sub_client.subscribe(topic.clone(), QoS::AtMostOnce).await;
                         }
-                        info!("controller subscribed to device state + connection + mixes");
+                        info!("controller subscribed to device state + connection + recipes");
                     }
                     Ok(Event::Incoming(Packet::Publish(p))) => {
                         if p.topic == sub_topics.state {
@@ -72,10 +72,10 @@ impl MqttDevice {
                                 c.conn_state = Some(cp.connection_state);
                                 c.conn_at = Some(Utc::now());
                             }
-                        } else if p.topic == sub_topics.mixes {
+                        } else if p.topic == sub_topics.recipes {
                             match serde_json::from_slice::<Vec<MixPreset>>(&p.payload) {
                                 Ok(presets) => cache_bg.lock().unwrap().presets = presets,
-                                Err(e) => warn!(error = %e, "bad mixes payload"),
+                                Err(e) => warn!(error = %e, "bad recipes payload"),
                             }
                         }
                     }
@@ -97,7 +97,7 @@ impl MqttDevice {
 
     fn derive_connection(cache: &Cache) -> MachineConnection {
         let status = match (&cache.conn_state, cache.conn_at) {
-            (Some(s), Some(at)) if s == "ONLINE" => {
+            (Some(s), Some(at)) if *s == 1 => {
                 if (Utc::now() - at).num_seconds() < STALE_SECS {
                     ConnectionStatus::Online
                 } else {
@@ -117,31 +117,15 @@ impl MqttDevice {
 #[async_trait]
 impl Device for MqttDevice {
     async fn submit(&self, job: &DelayeringJobRequest) -> SubmitOutcome {
-        // Gate on the cached connection + state for immediate UI feedback; the
-        // device is the authoritative guard (it ignores requests while busy).
-        let (conn, busy, current) = {
+        // Only gate on connection — the device QUEUES orders (FIFO) and runs each
+        // when free, so a busy machine is fine; the order simply waits its turn.
+        let conn = {
             let c = self.cache.lock().unwrap();
-            let conn = Self::derive_connection(&c);
-            let busy = c
-                .state
-                .as_ref()
-                .map(|s| s.system_status == SystemStatus::Running)
-                .unwrap_or(false);
-            let current = c
-                .state
-                .as_ref()
-                .and_then(|s| s.current_job.clone())
-                .unwrap_or_default();
-            (conn, busy, current)
+            Self::derive_connection(&c)
         };
 
         if conn.status != ConnectionStatus::Online {
             return SubmitOutcome::Unavailable("Delayering machine is offline".to_string());
-        }
-        if busy {
-            return SubmitOutcome::Busy(format!(
-                "Machine busy executing {current} — job rejected"
-            ));
         }
 
         let payload = match serde_json::to_vec(job) {
@@ -187,7 +171,7 @@ impl Device for MqttDevice {
         };
         match self
             .client
-            .publish(self.topics.mixes_save.clone(), QoS::AtMostOnce, false, payload)
+            .publish(self.topics.recipes_save.clone(), QoS::AtMostOnce, false, payload)
             .await
         {
             Ok(()) => {

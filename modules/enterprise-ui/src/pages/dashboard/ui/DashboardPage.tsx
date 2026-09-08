@@ -3,28 +3,22 @@ import { StatusBadge, type StatusTone } from "@/shared/ui/StatusBadge";
 import { formatTimestamp } from "@/shared/lib/formatTimestamp";
 import { PushedJobList } from "@/entities/job-request";
 import {
-  BeakerChemicalPanel,
   ChemicalStoragePanel,
   CurrentJobPanel,
+  connectionStatusLabel,
   getMachineConnection,
   getMachineState,
   SensorPanel,
   StatusGrid,
-  type ConnectionStatus,
   type MachineConnection,
   type MachineState,
 } from "@/entities/machine";
 
-const connectionTone: Record<ConnectionStatus, StatusTone> = {
-  ONLINE: "ok",
-  OFFLINE: "neutral",
-  CONNECTION_BROKEN: "danger",
-};
-
-const connectionLabel: Record<ConnectionStatus, string> = {
-  ONLINE: "Online",
-  OFFLINE: "Offline",
-  CONNECTION_BROKEN: "Connection broken",
+// connectionState: 1=ONLINE, 2=OFFLINE, 3=CONNECTION_BROKEN
+const connectionTone: Record<number, StatusTone> = {
+  1: "ok",
+  2: "neutral",
+  3: "danger",
 };
 
 export function DashboardPage() {
@@ -50,8 +44,8 @@ export function DashboardPage() {
           <div className="flex items-center gap-2 text-sm text-slate-500">
             <span>Machine</span>
             <StatusBadge
-              tone={connectionTone[conn.data.status]}
-              label={connectionLabel[conn.data.status]}
+              tone={connectionTone[conn.data.status] ?? "neutral"}
+              label={connectionStatusLabel(conn.data.status)}
             />
             {conn.data.receivedAt && (
               <span className="text-xs text-slate-400">
@@ -97,14 +91,13 @@ export function DashboardPage() {
             <CurrentJobPanel state={state.data} />
           </div>
 
-          {/* Chemical storage + which chemical is in each beaker */}
+          {/* Chemical storage cylinder fill levels */}
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-[2fr_1fr]">
             <ChemicalStoragePanel levels={state.data.chemicalStorage} />
-            <BeakerChemicalPanel chemicals={state.data.beakerChemicals} />
           </div>
 
           {/* All saved (pushed) jobs from the UI local store */}
-          <PushedJobList completedJobs={state.data.completedJobs} />
+          <PushedJobList completed={state.data.lastCompleted} />
         </div>
       )}
     </div>

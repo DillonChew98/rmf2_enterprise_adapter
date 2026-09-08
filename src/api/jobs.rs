@@ -1,5 +1,6 @@
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::{get, post}};
 use chrono::Utc;
+use serde::Serialize;
 
 use crate::api::{ApiResult, error_response};
 use crate::device::device::SubmitOutcome;
@@ -13,6 +14,22 @@ pub fn router() -> Router<AppState> {
             get(list_requests).post(submit_request),
         )
         .route("/api/machine/request/previous", get(previous_request))
+        .route("/api/machine/job-order/next", post(next_job_order))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobOrderResponse {
+    job_order: String,
+}
+
+/// POST /api/machine/job-order/next — reserve the next unique work-order id
+/// (e.g. "LIMS-JO-0007"). The operator gets one before assigning ports/jobs.
+async fn next_job_order(State(state): State<AppState>) -> ApiResult<JobOrderResponse> {
+    let job_order = state.jobs.next_job_order().await.map_err(|e| {
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("store error: {e}"))
+    })?;
+    Ok((StatusCode::OK, Json(JobOrderResponse { job_order })))
 }
 
 /// POST /api/machine/request — send a job to the device. The device accepts it

@@ -4,16 +4,16 @@ use tracing::info;
 use crate::catalog::catalog::ChemicalCatalog;
 use crate::catalog::model::Chemical;
 
+// The finalized 8-chemical catalog. Position = chemical code (line 1 = code 1).
 const DEFAULT_CHEMICALS: &[&str] = &[
-    "BOE",
-    "HCl",
-    "HNO3",
-    "HF",
-    "Poly etch (MAE)",
-    "Choline hydroxide",
-    "H2SO4",
-    "H2O2",
-    "H2O",
+    "Nitric Acid 70% (HNO3)",
+    "Hydrofluoric Acid 49% (HF)",
+    "Hydrochloric Acid 37% (HCl)",
+    "95% Poly Etch MAE (MAE)",
+    "BOE 7:1 (BOE)",
+    "Choline Hydroxide",
+    "Spare 1",
+    "Spare 2",
 ];
 
 /// Chemical catalog backed by a plain text file (one name per line, `#`
@@ -46,16 +46,22 @@ impl StaticChemicalCatalog {
 }
 
 fn parse_lines(contents: &str) -> Vec<Chemical> {
+    // Position determines the chemical code: first listed = code 1, etc.
     contents
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(Chemical::new)
+        .enumerate()
+        .map(|(i, l)| Chemical::new((i + 1) as u8, l))
         .collect()
 }
 
 fn default_chemicals() -> Vec<Chemical> {
-    DEFAULT_CHEMICALS.iter().map(|c| Chemical::new(*c)).collect()
+    DEFAULT_CHEMICALS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Chemical::new((i + 1) as u8, *c))
+        .collect()
 }
 
 #[async_trait]

@@ -1,65 +1,34 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { FormProvider, useFieldArray, useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
+import { useState } from "react";
 import type { LimsJob } from "@/entities/lims-job";
-import { listMixPresets, type MixPreset } from "@/entities/mix-preset";
+import {
+  listMixPresets,
+  recipeLabel,
+  type MixPreset,
+} from "@/entities/mix-preset";
 import { useFetch } from "@/shared/lib/hooks/useFetch";
 import { Button } from "@/shared/ui/Button";
 import { Input } from "@/shared/ui/Input";
+import { Select } from "@/shared/ui/Select";
+import { Combobox } from "@/shared/ui/Combobox";
+import { Toast } from "@/shared/ui/Toast";
 import { Card } from "@/shared/ui/Card";
-import { StatusBadge } from "@/shared/ui/StatusBadge";
 import { cn } from "@/shared/lib/cn";
 import { apiErrorMessage } from "@/shared/api/axios";
-import { formatTimestamp } from "@/shared/lib/formatTimestamp";
-import { MAX_STEPS } from "../model/types";
+import { PORTS, MAX_STEPS } from "../model/types";
 import {
-  applyLimsJob,
-  applyPreviousJob,
-  emptyJobForm,
+  emptyPort,
   emptyStep,
-  jobFormSchema,
-  toJobRequest,
-  type JobFormValues,
+  applyLimsToPort,
+  buildJobRequest,
+  requestToPorts,
+  type PortForm,
 } from "../model/schema";
 import { getPreviousLocalJob, saveLocalJob } from "../lib/localJobStore";
-import { ChemicalStepFields } from "./ChemicalStepFields";
+import { newJobOrder, submitJob } from "../api/jobApi";
 
-function arrayMessage(err: unknown): string | undefined {
-  if (err && typeof err === "object") {
-    const e = err as { message?: unknown; root?: { message?: unknown } };
-    if (typeof e.message === "string") return e.message;
-    if (e.root && typeof e.root.message === "string") return e.root.message;
-  }
-  return undefined;
-}
-
-// Persist the in-progress job draft so a page refresh keeps the operator on the
-// same view (with their selected job + inputs) instead of resetting.
-const STORAGE_KEY = "enterprise-ui:job-input-draft";
-
-function loadDraft(): JobFormValues {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return emptyJobForm();
-    // Merge over defaults so a model change can't leave required keys missing.
-    return { ...emptyJobForm(), ...JSON.parse(raw) };
-  } catch {
-    return emptyJobForm();
-  }
-}
-
-function clearDraft() {
-  try {
-    localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    /* ignore */
-  }
-}
-
-// A right-aligned label + control row, matching the HMI "Input Job Order" layout.
-function Row({ label, children }: { label: string; children: ReactNode }) {
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="grid grid-cols-1 gap-1 sm:grid-cols-[150px_minmax(0,1fr)] sm:items-start sm:gap-4">
+    <div className="grid grid-cols-1 gap-1 sm:grid-cols-[130px_minmax(0,1fr)] sm:items-start sm:gap-4">
       <label className="text-sm font-medium text-slate-700 sm:pt-2 sm:text-right">
         {label}
       </label>
@@ -73,369 +42,346 @@ interface JobFormProps {
 }
 
 export function JobForm({ limsJobs }: JobFormProps) {
-  const methods = useForm<JobFormValues>({
-    resolver: zodResolver(jobFormSchema),
-    defaultValues: loadDraft(),
-    mode: "onSubmit",
-  });
-  const { register, handleSubmit, watch, setValue, getValues, reset, control, formState } =
-    methods;
-  const { errors, isSubmitting } = formState;
+  const [jobOrder, setJobOrder] = useState<string | null>(null);
+  const [operatorName, setOperatorName] = useState("");
+  const [ports, setPorts] = useState<PortForm[]>([emptyPort("1")]);
+  const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<{
+    message: string;
+    tone: "success" | "error";
+  } | null>(null);
+  const [copyNote, setCopyNote] = useState<string | null>(null);
+  const [ordering, setOrdering] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  // Persist the draft on every change so a refresh restores this view.
-  useEffect(() => {
-    const sub = watch((value) => {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
-      } catch {
-        /* ignore quota / disabled storage */
-      }
-    });
-    return () => sub.unsubscribe();
-  }, [watch]);
-
-  const stepsArray = useFieldArray({ control, name: "steps" });
-
-  // Device-owned recipes (GET /api/mix-presets) for the process-step dropdowns.
   const { state: recipeState } = useFetch<MixPreset[]>(listMixPresets, {
     intervalMs: 5000,
   });
   const recipes = recipeState.status === "ok" ? recipeState.data : [];
+  const recipeOptions = recipes.map((r) => ({
+    value: r.name,
+    label: `${r.name} — ${recipeLabel(r)}`,
+  }));
+  const limsOptions = limsJobs.map((j) => ({
+    value: j.jobNumber,
+    label: `${j.jobNumber} · ${j.analysisType} · ${j.status}`,
+  }));
 
-  const [lookup, setLookup] = useState("");
-  const [sort, setSort] = useState<{
-    key: "jobNumber" | "submissionTime" | "status";
-    dir: "asc" | "desc";
-  } | null>({ key: "submissionTime", dir: "desc" });
-  const [lookupError, setLookupError] = useState<string | null>(null);
-  const [submittedJob, setSubmittedJob] = useState<string | null>(null);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [copyNote, setCopyNote] = useState<string | null>(null);
+  const usedPorts = ports.map((p) => p.port);
+  const portOptions = (current: string) =>
+    PORTS.filter((p) => p === current || !usedPorts.includes(p)).map((p) => ({
+      value: p,
+      label: p,
+    }));
 
-  const jobNumber = watch("jobNumber");
-  const loadports = watch("loadports");
-  const hasJob = Boolean(jobNumber);
-
-  function toggleLoadport(n: string) {
-    const set = new Set(loadports);
-    if (set.has(n)) set.delete(n);
-    else set.add(n);
-    setValue("loadports", Array.from(set).sort(), { shouldValidate: true });
+  function updatePort(i: number, patch: Partial<PortForm>) {
+    setPorts((prev) => prev.map((p, k) => (k === i ? { ...p, ...patch } : p)));
   }
 
-  const filter = lookup.trim().toLowerCase();
-  const filtered = limsJobs.filter(
-    (j) =>
-      j.jobNumber.toLowerCase().includes(filter) ||
-      (j.stain ?? "").toLowerCase().includes(filter)
-  );
-
-  // ISO submission times sort lexicographically == chronologically.
-  const sorted = sort
-    ? [...filtered].sort((a, b) => {
-        const cmp = String(a[sort.key] ?? "").localeCompare(
-          String(b[sort.key] ?? "")
-        );
-        return sort.dir === "asc" ? cmp : -cmp;
-      })
-    : filtered;
-
-  function toggleSort(key: "jobNumber" | "submissionTime" | "status") {
-    setSort((cur) =>
-      cur && cur.key === key
-        ? { key, dir: cur.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: "asc" }
+  function pickLims(i: number, jobNumber: string) {
+    const job = limsJobs.find((j) => j.jobNumber === jobNumber);
+    setPorts((prev) =>
+      prev.map((p, k) =>
+        k === i
+          ? job
+            ? applyLimsToPort(p, job)
+            : { ...p, jobNumber: "" }
+          : p
+      )
     );
   }
 
-  function sortIcon(key: "jobNumber" | "submissionTime" | "status") {
-    if (!sort || sort.key !== key) return "↕";
-    return sort.dir === "asc" ? "▲" : "▼";
+  function pickRecipe(pi: number, si: number, name: string) {
+    const r = recipes.find((x) => x.name === name);
+    setPorts((prev) =>
+      prev.map((p, k) => {
+        if (k !== pi) return p;
+        const steps = p.steps.map((s, m) =>
+          m === si
+            ? r
+              ? {
+                  recipeName: r.name,
+                  mode: r.mode,
+                  chemical: r.chemical,
+                  components: r.components,
+                  method: r.method,
+                  durationSec: r.durationSec,
+                }
+              : emptyStep()
+            : s
+        );
+        return { ...p, steps };
+      })
+    );
   }
 
-  function selectJob(job: LimsJob) {
-    setLookupError(null);
-    setSubmittedJob(null);
-    reset(applyLimsJob(emptyJobForm(), job));
+  function addStep(pi: number) {
+    setPorts((prev) =>
+      prev.map((p, k) =>
+        k === pi && p.steps.length < MAX_STEPS
+          ? { ...p, steps: [...p.steps, emptyStep()] }
+          : p
+      )
+    );
+  }
+  function removeStep(pi: number, si: number) {
+    setPorts((prev) =>
+      prev.map((p, k) =>
+        k === pi ? { ...p, steps: p.steps.filter((_, m) => m !== si) } : p
+      )
+    );
   }
 
-  function changeJob() {
-    clearDraft();
-    reset(emptyJobForm());
-    setLookup("");
-    setSubmittedJob(null);
-    setFormError(null);
+  function addPort() {
+    const free = PORTS.find((p) => !usedPorts.includes(p));
+    if (free) setPorts((prev) => [...prev, emptyPort(free)]);
+  }
+  function removePort(i: number) {
+    setPorts((prev) => prev.filter((_, k) => k !== i));
+  }
+
+  // Clears the form back to empty (leaves any active toast to auto-dismiss).
+  function reset() {
+    setJobOrder(null);
+    setOperatorName("");
+    setPorts([emptyPort("1")]);
+    setError(null);
     setCopyNote(null);
   }
 
-  // Clear the operator inputs but keep the selected LIMS job.
-  function clearInputs() {
-    const v = getValues();
-    reset({
-      ...emptyJobForm(),
-      jobNumber: v.jobNumber,
-      analysisType: v.analysisType,
-      submissionTime: v.submissionTime,
-      limsStatus: v.limsStatus,
-      stain: v.stain,
-    });
-    setFormError(null);
-    setSubmittedJob(null);
+  // Step 1 of the flow: ask the backend for a fresh work-order id, then start a
+  // blank order under it.
+  async function newOrder() {
+    setError(null);
+    setToast(null);
     setCopyNote(null);
+    setOrdering(true);
+    try {
+      const jo = await newJobOrder();
+      setJobOrder(jo);
+      setOperatorName("");
+      setPorts([emptyPort("1")]);
+    } catch (e) {
+      setError(apiErrorMessage(e));
+    } finally {
+      setOrdering(false);
+    }
   }
 
-  function copyPreviousJob() {
+  function copyPrevious() {
     setCopyNote(null);
     const prev = getPreviousLocalJob();
     if (!prev) {
-      setCopyNote("No previous job to copy yet.");
+      setCopyNote("No previous order to copy yet.");
       return;
     }
-    reset(applyPreviousJob(getValues(), prev));
-    setCopyNote(`Copied operator inputs from job ${prev.jobNumber}.`);
+    setOperatorName(prev.operatorName);
+    setPorts(requestToPorts(prev));
+    setCopyNote(`Copied ports from ${prev.jobOrder} into ${jobOrder}.`);
   }
 
-  const onSubmit = handleSubmit(async (values) => {
-    setFormError(null);
-    setSubmittedJob(null);
-    try {
-      saveLocalJob(toJobRequest(values));
-      setSubmittedJob(values.jobNumber);
-      clearDraft();
-    } catch (err) {
-      setFormError(apiErrorMessage(err));
+  async function save() {
+    setError(null);
+    setToast(null);
+    if (!jobOrder) return setError("Click 'New order' to generate a job order first");
+    if (!operatorName.trim()) return setError("Enter an operator name");
+    const withJob = ports.filter((p) => p.jobNumber.trim());
+    if (withJob.length === 0)
+      return setError("Assign a job number to at least one port");
+    for (const p of withJob) {
+      if (!p.steps.some((s) => s.recipeName))
+        return setError(`Port ${p.port}: pick at least one recipe`);
     }
-  });
+
+    const request = buildJobRequest(jobOrder, operatorName.trim(), ports);
+    setSaving(true);
+    try {
+      const saved = saveLocalJob(request);
+      let sent = false;
+      try {
+        await submitJob(saved);
+        sent = true;
+      } catch {
+        /* saved locally regardless; stays PENDING if the machine is unreachable */
+      }
+      reset();
+      setToast(
+        sent
+          ? {
+              message: `Order ${saved.jobOrder} sent to the machine ✓`,
+              tone: "success",
+            }
+          : {
+              message: `Order ${saved.jobOrder} saved — machine unreachable`,
+              tone: "error",
+            }
+      );
+    } catch (e) {
+      setError(apiErrorMessage(e));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
-    <FormProvider {...methods}>
-      <form onSubmit={onSubmit} className="space-y-6">
-        {/* Step 1 — pick a job from the LIMS */}
-        {!hasJob && (
-          <Card title="LIMS Job Lookup">
-            <div className="space-y-3">
-              <Input
-                label="Filter"
-                placeholder="Filter by job number or stain…"
-                value={lookup}
-                onChange={(e) => setLookup(e.target.value)}
-              />
-              {lookupError && (
-                <p className="text-xs text-rose-600">{lookupError}</p>
-              )}
-              <div className="overflow-hidden rounded-md border border-slate-200">
-                <table className="w-full text-sm">
-                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                    <tr>
-                      <th
-                        className="cursor-pointer select-none px-3 py-2 font-medium hover:text-slate-700"
-                        onClick={() => toggleSort("jobNumber")}
-                      >
-                        Job Number{" "}
-                        <span className="text-slate-400">
-                          {sortIcon("jobNumber")}
-                        </span>
-                      </th>
-                      <th className="px-3 py-2 font-medium">Analysis</th>
-                      <th
-                        className="cursor-pointer select-none px-3 py-2 font-medium hover:text-slate-700"
-                        onClick={() => toggleSort("submissionTime")}
-                      >
-                        Submitted{" "}
-                        <span className="text-slate-400">
-                          {sortIcon("submissionTime")}
-                        </span>
-                      </th>
-                      <th
-                        className="cursor-pointer select-none px-3 py-2 font-medium hover:text-slate-700"
-                        onClick={() => toggleSort("status")}
-                      >
-                        Status{" "}
-                        <span className="text-slate-400">
-                          {sortIcon("status")}
-                        </span>
-                      </th>
-                      <th className="px-3 py-2 font-medium">Stain</th>
-                      <th className="px-3 py-2" />
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {sorted.length === 0 ? (
-                      <tr>
-                        <td
-                          colSpan={6}
-                          className="px-3 py-6 text-center text-slate-400"
-                        >
-                          No matching LIMS jobs.
-                        </td>
-                      </tr>
-                    ) : (
-                      sorted.map((j) => (
-                        <tr key={j.jobNumber} className="hover:bg-slate-50">
-                          <td className="px-3 py-2 font-medium text-slate-900">
-                            {j.jobNumber}
-                          </td>
-                          <td className="px-3 py-2 text-slate-600">
-                            {j.analysisType}
-                          </td>
-                          <td className="px-3 py-2 text-slate-600">
-                            {formatTimestamp(j.submissionTime) ?? "—"}
-                          </td>
-                          <td className="px-3 py-2">
-                            <StatusBadge
-                              tone={j.status === "In Progress" ? "active" : "info"}
-                              label={j.status}
-                            />
-                          </td>
-                          <td className="px-3 py-2 text-slate-600">
-                            {j.stain ?? "—"}
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <Button size="sm" onClick={() => selectJob(j)}>
-                              Select
-                            </Button>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-              <p className="text-xs text-slate-500">
-                {limsJobs.length} open job(s) from the LIMS · refreshes
-                automatically.
-              </p>
-            </div>
-          </Card>
+    <section className="rounded-lg border border-slate-300 bg-white shadow-sm">
+      {toast && (
+        <Toast
+          message={toast.message}
+          tone={toast.tone}
+          onDismiss={() => setToast(null)}
+        />
+      )}
+      <div className="rounded-t-lg border-b border-slate-300 bg-slate-200 px-5 py-3 text-center">
+        <h3 className="text-base font-semibold text-slate-900">Input Job Order</h3>
+      </div>
+
+      <div className="space-y-5 px-6 py-6">
+        {/* Step 1: the operator gets a backend-assigned work-order id, then
+            fills in the ports/jobs/recipes under it. */}
+        <div className="flex items-center justify-between gap-3 rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
+          <div className="text-sm">
+            {jobOrder ? (
+              <span className="text-slate-700">
+                Job order{" "}
+                <span className="font-semibold text-slate-900">{jobOrder}</span>
+              </span>
+            ) : (
+              <span className="text-slate-500">
+                No active order — generate one to begin.
+              </span>
+            )}
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={newOrder}
+            disabled={ordering}
+          >
+            {ordering ? "Generating…" : "New order"}
+          </Button>
+        </div>
+
+        {copyNote && (
+          <p className="rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-600">
+            {copyNote}
+          </p>
+        )}
+        {error && (
+          <p className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            {error}
+          </p>
         )}
 
-        {/* Step 2 — Input Job Order (HMI slide 7) */}
-        {hasJob && (
-          <section className="rounded-lg border border-slate-300 bg-white shadow-sm">
-            <div className="rounded-t-lg border-b border-slate-300 bg-slate-200 px-5 py-3 text-center">
-              <h3 className="text-base font-semibold text-slate-900">
-                Input Job Order
-              </h3>
-            </div>
+        {jobOrder && (
+          <>
+        <Row label="Operator name">
+          <Input
+            value={operatorName}
+            onChange={(e) => setOperatorName(e.target.value)}
+          />
+        </Row>
 
-            <div className="space-y-5 px-6 py-6">
-              <Row label="Job Number">
-                <Input value={jobNumber} readOnly disabled />
-                <p className="mt-1 text-xs text-slate-500">
-                  {[
-                    watch("analysisType"),
-                    watch("limsStatus"),
-                    watch("stain"),
-                    formatTimestamp(watch("submissionTime") || null),
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
-              </Row>
-
-              <Row label="Operator name">
-                <Input
-                  error={errors.operatorName?.message}
-                  {...register("operatorName")}
+        {ports.map((p, i) => (
+          <Card key={i} title={`Port ${p.port}`}>
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-[120px_minmax(0,1fr)]">
+                <Select
+                  label="Port #"
+                  options={portOptions(p.port)}
+                  value={p.port}
+                  onChange={(e) => updatePort(i, { port: e.target.value })}
                 />
-              </Row>
+                <Combobox
+                  label="Job Number"
+                  placeholder="Search LIMS jobs…"
+                  options={limsOptions}
+                  value={p.jobNumber}
+                  onChange={(v) => pickLims(i, v)}
+                />
+              </div>
+              {p.jobNumber && (
+                <p className="text-xs text-slate-500">
+                  {[p.analysisType, p.limsStatus, p.stain].filter(Boolean).join(" · ")}
+                </p>
+              )}
 
-              <Row label="Select Port#">
-                <div className="flex gap-2">
-                  {["1", "2", "3", "4"].map((n) => {
-                    const active = loadports.includes(n);
-                    return (
-                      <button
-                        key={n}
-                        type="button"
-                        onClick={() => toggleLoadport(n)}
-                        aria-pressed={active}
-                        className={cn(
-                          "h-9 w-9 rounded-full border text-sm font-medium transition",
-                          active
-                            ? "border-slate-900 bg-slate-900 text-white"
-                            : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-                        )}
+              <div className="space-y-2">
+                {p.steps.map((s, si) => (
+                  <div key={si} className="flex items-end gap-2">
+                    <div className="flex-1">
+                      <Select
+                        label={`Process step #${si + 1}`}
+                        placeholder="Select a recipe…"
+                        options={recipeOptions}
+                        value={s.recipeName}
+                        onChange={(e) => pickRecipe(i, si, e.target.value)}
+                      />
+                    </div>
+                    {p.steps.length > 1 && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => removeStep(i, si)}
+                        aria-label="Remove step"
                       >
-                        {n}
-                      </button>
-                    );
-                  })}
-                </div>
-                {arrayMessage(errors.loadports) && (
-                  <p className="mt-1 text-xs text-rose-600">
-                    {arrayMessage(errors.loadports)}
-                  </p>
-                )}
-              </Row>
-
-              <div className="space-y-3">
-                {stepsArray.fields.map((field, i) => (
-                  <ChemicalStepFields
-                    key={field.id}
-                    index={i}
-                    removable={stepsArray.fields.length > 1}
-                    onRemove={() => stepsArray.remove(i)}
-                    recipes={recipes}
-                  />
+                        ✕
+                      </Button>
+                    )}
+                  </div>
                 ))}
-                {arrayMessage(errors.steps) && (
-                  <p className="text-xs text-rose-600">
-                    {arrayMessage(errors.steps)}
-                  </p>
-                )}
                 <Button
                   variant="secondary"
                   size="sm"
-                  onClick={() => stepsArray.append(emptyStep())}
-                  disabled={stepsArray.fields.length >= MAX_STEPS}
+                  onClick={() => addStep(i)}
+                  disabled={p.steps.length >= MAX_STEPS}
                 >
-                  + Add process step ({stepsArray.fields.length}/{MAX_STEPS})
+                  + Add process step ({p.steps.length}/{MAX_STEPS})
                 </Button>
               </div>
 
-              {copyNote && (
-                <p className="rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-600">
-                  {copyNote}
-                </p>
+              {ports.length > 1 && (
+                <div className="flex justify-end">
+                  <Button variant="ghost" size="sm" onClick={() => removePort(i)}>
+                    Remove port
+                  </Button>
+                </div>
               )}
-              {formError && (
-                <p className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700">
-                  {formError}
-                </p>
-              )}
-              {submittedJob && (
-                <p className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-                  Job {submittedJob} saved to the pushed job list.
-                </p>
-              )}
-
-              <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
-                <Button variant="ghost" size="sm" onClick={copyPreviousJob}>
-                  Copy previous job
-                </Button>
-                <div className="flex-1" />
-                <Button
-                  onClick={clearInputs}
-                  className="bg-sky-700 text-white hover:bg-sky-800"
-                >
-                  Clear ALL
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="bg-amber-400 text-slate-900 hover:bg-amber-500"
-                >
-                  {isSubmitting ? "Saving…" : "Save"}
-                </Button>
-                <Button variant="secondary" onClick={changeJob}>
-                  Return
-                </Button>
-              </div>
             </div>
-          </section>
+          </Card>
+        ))}
+
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={addPort}
+          disabled={usedPorts.length >= PORTS.length}
+        >
+          + Add port
+        </Button>
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
+          <Button variant="ghost" size="sm" onClick={copyPrevious}>
+            Copy previous order
+          </Button>
+          <div className="flex-1" />
+          <Button
+            onClick={reset}
+            className={cn("bg-sky-700 text-white hover:bg-sky-800")}
+          >
+            Clear ALL
+          </Button>
+          <Button
+            onClick={save}
+            disabled={saving}
+            className="bg-amber-400 text-slate-900 hover:bg-amber-500"
+          >
+            {saving ? "Saving…" : "Save"}
+          </Button>
+        </div>
+          </>
         )}
-      </form>
-    </FormProvider>
+      </div>
+    </section>
   );
 }

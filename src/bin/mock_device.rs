@@ -3,6 +3,7 @@
 //   consumes `request` (a job) and executes it deterministically.
 // While running a job it ignores new requests — the authoritative busy guard.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use rmf2_enterprise_adapter::device::executor::Executor;
 use rmf2_enterprise_adapter::device::model::{ConnectionPayload, MixPreset};
 use rmf2_enterprise_adapter::device::topics::MachineTopics;
 use rmf2_enterprise_adapter::jobs::model::{
-    ChemicalStep, DelayeringJobRequest, JobKind, MixComponent,
+    ChemicalStep, DelayeringJobRequest, MixComponent, RunJob,
 };
 
 const MIX_PRESETS_FILE: &str = "mix_presets.json";
@@ -35,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
 
     let exec = Arc::new(Mutex::new(Executor::new()));
     let presets = Arc::new(Mutex::new(load_presets()));
+    // Pushed job orders wait here until the machine is free (FIFO). They run
+    // ahead of the ambient demo jobs so operator-submitted orders complete.
+    let queue = Arc::new(Mutex::new(VecDeque::<RunJob>::new()));
 
     {
         let exec = exec.clone();
@@ -79,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // priority via the executor's busy guard.
     {
         let exec = exec.clone();
+        let queue = queue.clone();
         tokio::spawn(async move {
             let jobs = demo_jobs();
             let mut idx = 0usize;
@@ -89,6 +94,14 @@ async fn main() -> anyhow::Result<()> {
                 let running = exec.lock().expect("executor mutex poisoned").running();
                 if running {
                     idle_secs = 0;
+                    continue;
+                }
+                // A queued operator order runs immediately; otherwise fall back to
+                // an ambient demo job after a short idle gap.
+                if let Some(order) = queue.lock().expect("queue mutex poisoned").pop_front() {
+                    idle_secs = 0;
+                    exec.lock().expect("executor mutex poisoned").try_submit(&order);
+                    info!(job = %order.job_number, order = %order.job_order, "running queued order");
                     continue;
                 }
                 idle_secs += 1;
@@ -118,14 +131,14 @@ async fn main() -> anyhow::Result<()> {
                     .subscribe(topics.request.clone(), QoS::AtMostOnce)
                     .await;
                 let _ = client
-                    .subscribe(topics.mixes_save.clone(), QoS::AtMostOnce)
+                    .subscribe(topics.recipes_save.clone(), QoS::AtMostOnce)
                     .await;
                 publish_connection(&client, &topics, &device_id).await;
                 let snapshot = presets.lock().expect("presets mutex poisoned").clone();
-                publish_mixes(&client, &topics, &snapshot).await;
-                info!("device online; subscribed to request + mixes_save");
+                publish_recipes(&client, &topics, &snapshot).await;
+                info!("device online; subscribed to request + recipes/save");
             }
-            Ok(Event::Incoming(Packet::Publish(p))) if p.topic == topics.mixes_save => {
+            Ok(Event::Incoming(Packet::Publish(p))) if p.topic == topics.recipes_save => {
                 match serde_json::from_slice::<MixPreset>(&p.payload) {
                     Ok(preset) => {
                         {
@@ -136,26 +149,22 @@ async fn main() -> anyhow::Result<()> {
                         let snapshot =
                             presets.lock().expect("presets mutex poisoned").clone();
                         save_presets(&snapshot);
-                        publish_mixes(&client, &topics, &snapshot).await;
-                        info!(mix = %preset.name, "mix preset saved");
+                        publish_recipes(&client, &topics, &snapshot).await;
+                        info!(recipe = %preset.name, "recipe saved");
                     }
-                    Err(e) => warn!(error = %e, "bad mix-save payload"),
+                    Err(e) => warn!(error = %e, "bad recipe-save payload"),
                 }
             }
             Ok(Event::Incoming(Packet::Publish(p))) if p.topic == topics.request => {
                 match serde_json::from_slice::<DelayeringJobRequest>(&p.payload) {
-                    Ok(job) => {
-                        let accepted = {
-                            exec.lock().expect("executor mutex poisoned").try_submit(&job)
-                        };
-                        info!(job = %job.job_number, accepted, "request received");
-                        // Reflect acceptance immediately.
-                        let snapshot =
-                            { exec.lock().expect("executor mutex poisoned").snapshot() };
-                        if let Ok(payload) = serde_json::to_vec(&snapshot) {
-                            let _ = client
-                                .publish(topics.state.clone(), QoS::AtMostOnce, true, payload)
-                                .await;
+                    Ok(order) => {
+                        // Split the order into its per-port jobs and queue each —
+                        // the runner starts them as the machine frees up.
+                        let run_jobs = order.into_run_jobs();
+                        info!(count = run_jobs.len(), "order queued");
+                        let mut q = queue.lock().expect("queue mutex poisoned");
+                        for rj in run_jobs {
+                            q.push_back(rj);
                         }
                     }
                     Err(e) => warn!(error = %e, "bad request payload"),
@@ -174,7 +183,7 @@ async fn publish_connection(client: &AsyncClient, topics: &MachineTopics, device
     let payload = ConnectionPayload {
         timestamp: Utc::now(),
         device_id: device_id.to_string(),
-        connection_state: "ONLINE".to_string(),
+        connection_state: 1, // 1=ONLINE
     };
     if let Ok(bytes) = serde_json::to_vec(&payload) {
         let _ = client
@@ -185,75 +194,66 @@ async fn publish_connection(client: &AsyncClient, topics: &MachineTopics, device
 
 // The device's mix presets are published retained so the controller gets the
 // current list as soon as it subscribes.
-async fn publish_mixes(client: &AsyncClient, topics: &MachineTopics, presets: &[MixPreset]) {
+async fn publish_recipes(client: &AsyncClient, topics: &MachineTopics, presets: &[MixPreset]) {
     if let Ok(bytes) = serde_json::to_vec(presets) {
         let _ = client
-            .publish(topics.mixes.clone(), QoS::AtLeastOnce, true, bytes)
+            .publish(topics.recipes.clone(), QoS::AtLeastOnce, true, bytes)
             .await;
     }
 }
 
-// A small demo queue so the dashboard always has something to show. Step
-// durations are clamped to a few seconds by the executor, so jobs cycle quickly.
-fn demo_jobs() -> Vec<DelayeringJobRequest> {
-    let single = |chemical: &str, method: &str, m: &str, s: &str| ChemicalStep {
+// A small set of ambient demo jobs so the dashboard always has something to
+// show. Step durations are clamped to a few seconds by the executor.
+fn demo_jobs() -> Vec<RunJob> {
+    // method codes: 1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE. mode: 1=single, 2=mix.
+    // chemical codes: 1=HNO3, 2=HF, 3=HCl, 4=MAE, 5=BOE, 6=Choline.
+    let single = |chemical: i64, method: i64, secs: i64| ChemicalStep {
         recipe_name: String::new(),
-        mode: "single".to_string(),
-        chemical: chemical.to_string(),
+        mode: 1,
+        chemical,
         components: vec![],
-        method: method.to_string(),
-        duration_min: m.to_string(),
-        duration_sec: s.to_string(),
+        method,
+        duration_sec: secs,
     };
-    let mix = |a: &str, b: &str, method: &str, m: &str, s: &str| ChemicalStep {
+    let mix = |a: i64, b: i64, method: i64, secs: i64| ChemicalStep {
         recipe_name: String::new(),
-        mode: "mix".to_string(),
-        chemical: String::new(),
+        mode: 2,
+        chemical: 0,
         components: vec![
-            MixComponent { chemical: a.to_string(), parts: 50 },
-            MixComponent { chemical: b.to_string(), parts: 50 },
+            MixComponent { chemical: a, percent: 50 },
+            MixComponent { chemical: b, percent: 50 },
         ],
-        method: method.to_string(),
-        duration_min: m.to_string(),
-        duration_sec: s.to_string(),
+        method,
+        duration_sec: secs,
     };
-    let job = |number: &str, operator: &str, ports: &[&str], steps: Vec<ChemicalStep>| {
-        DelayeringJobRequest {
-            job_number: number.to_string(),
-            analysis_type: "SEM".to_string(),
-            submission_time: None,
-            lims_status: "P".to_string(),
-            stain: None,
-            operator_name: operator.to_string(),
-            loadports: ports.iter().map(|p| p.to_string()).collect(),
-            job: JobKind::ChemicalProcess { steps },
-            submitted_at: None,
-        }
+    // Ambient jobs have no operator order id.
+    let job = |number: &str, port: &str, steps: Vec<ChemicalStep>| RunJob {
+        job_order: String::new(),
+        port: port.to_string(),
+        job_number: number.to_string(),
+        steps,
     };
     vec![
         job(
             "J-100482",
-            "A. Tan",
-            &["1", "2"],
+            "1",
             vec![
-                single("HNO3", "ULTRASONIC", "5", "30"),
-                mix("HCl", "HNO3", "NIL", "1", ""),
+                single(1, 2, 330),   // HNO3, ULTRASONIC
+                mix(3, 1, 1, 60),    // HCl + HNO3, NIL
             ],
         ),
         job(
             "J-100483",
-            "M. Lee",
-            &["3"],
+            "3",
             vec![
-                single("BOE", "NIL", "2", ""),
-                single("HF", "ULTRASONIC", "", "5"),
+                single(5, 1, 120),   // BOE, NIL
+                single(2, 2, 5),     // HF, ULTRASONIC
             ],
         ),
         job(
             "J-100484",
-            "R. Goh",
-            &["4"],
-            vec![single("Choline hydroxide", "HEATED_PLATE", "3", "")],
+            "4",
+            vec![single(6, 3, 180)], // Choline, HEATED_PLATE
         ),
     ]
 }
@@ -261,25 +261,23 @@ fn demo_jobs() -> Vec<DelayeringJobRequest> {
 fn default_presets() -> Vec<MixPreset> {
     vec![
         MixPreset {
-            name: "HNO3 · 5m30s · Ultrasonic".to_string(),
-            mode: "single".to_string(),
-            chemical: "HNO3".to_string(),
+            name: "HNO3 etch".to_string(),
+            mode: 1,
+            chemical: 1, // HNO3
             components: vec![],
-            method: "ULTRASONIC".to_string(),
-            duration_min: "5".to_string(),
-            duration_sec: "30".to_string(),
+            method: 2, // ULTRASONIC
+            duration_sec: 330,
         },
         MixPreset {
-            name: "50% HCl + 50% HNO3 · 1m · NIL".to_string(),
-            mode: "mix".to_string(),
-            chemical: String::new(),
+            name: "HCl + HNO3 mix".to_string(),
+            mode: 2,
+            chemical: 0,
             components: vec![
-                MixComponent { chemical: "HCl".to_string(), parts: 50 },
-                MixComponent { chemical: "HNO3".to_string(), parts: 50 },
+                MixComponent { chemical: 3, percent: 50 }, // HCl
+                MixComponent { chemical: 1, percent: 50 }, // HNO3
             ],
-            method: "NIL".to_string(),
-            duration_min: "1".to_string(),
-            duration_sec: String::new(),
+            method: 1, // NIL
+            duration_sec: 60,
         },
     ]
 }

@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::jobs::model::MixComponent;
 
@@ -13,83 +14,55 @@ use crate::jobs::model::MixComponent;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixPreset {
-    pub name: String, // auto-label, e.g. "HNO3 (50%) · 5m30s · Ultrasonic"
+    pub name: String, // operator-defined recipe name, e.g. "HNO3 etch"
     #[serde(default)]
-    pub mode: String, // "single" | "mix"
+    pub mode: i64, // 1=single, 2=mix
     #[serde(default)]
-    pub chemical: String,
+    pub chemical: i64, // single: chemical code (0 when mix)
     #[serde(default)]
     pub components: Vec<MixComponent>,
     #[serde(default)]
-    pub method: String,
+    pub method: i64, // 1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE
     #[serde(default)]
-    pub duration_min: String,
-    #[serde(default)]
-    pub duration_sec: String,
+    pub duration_sec: i64, // total duration in seconds
 }
 
 // Mirrors the UI's machine types (entities/machine/model/types.ts). Serialized
-// camelCase; enum variants serialize as the UI's string unions. Deserialize is
-// derived too so the controller can parse the device's MQTT `state` payload.
+// camelCase; enum variants serialize as integer codes (see the ICD code tables).
+// Deserialize is derived too so the controller can parse the device's MQTT
+// `state` payload.
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SystemStatus {
-    Idle,
-    Running,
-    Error,
-    Offline,
+    Idle = 1,
+    Running = 2,
+    Error = 3,
+    Offline = 4,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum LevelStatus {
-    Ok,
-    Low,
-    Critical,
-    Empty,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProcessStatus {
-    NotStarted,
-    InProgress,
-    Complete,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CleaningStatus {
-    Idle,
-    Cleaning,
-    Complete,
-    Fault,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum SensorStatus {
-    Ok,
-    Triggered,
-    Fault,
-    Offline,
+    Ok = 1,
+    Fault = 2,
+    Offline = 3,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum StepStatus {
-    Pending,
-    Active,
-    Done,
+    Pending = 1,
+    Active = 2,
+    Done = 3,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ConnectionStatus {
-    Online,
-    Offline,
-    ConnectionBroken,
+    Online = 1,
+    Offline = 2,
+    ConnectionBroken = 3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,36 +80,46 @@ pub struct Sensor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobProcessStep {
-    pub chemical: String, // "BOE" or a mix like "1:1 HCl+HNO3"
-    pub method: String, // "Ultrasonic" | "Heated plate" | "Etching" | "Dispense …"
-    pub duration: String, // formatted, e.g. "4 min", "5 sec"
+    pub mode: i64,                    // 1=single, 2=mix
+    pub chemical: i64,                // single: chemical code (0 when mix)
+    pub components: Vec<MixComponent>, // mix: [{chemical, percent}]
+    pub method: i64,                  // method code (see ICD code tables)
+    pub duration_sec: i64,            // total duration in seconds
     pub status: StepStatus,
+}
+
+/// A job the machine is running now (it can run several at once, one per port).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentJob {
+    pub job_order: String, // "" for ambient (non-operator) jobs
+    pub port: String,
+    pub job_number: String,
+    pub steps: Vec<JobProcessStep>,
+}
+
+/// A job the machine has finished (newest first).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedJob {
+    pub job_order: String,
+    pub port: String,
+    pub job_number: String,
+    pub steps: Vec<JobProcessStep>,
+    pub at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineState {
     pub system_status: SystemStatus,
-    pub current_job: Option<String>,
-    pub current_job_steps: Vec<JobProcessStep>,
-    pub last_completed_job: Option<String>,
-    pub last_completed_steps: Vec<JobProcessStep>,
-    pub last_completed_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub completed_jobs: Vec<String>, // every job number the machine has finished
-    pub cycle_time_sec: u32,
+    pub current_jobs: Vec<CurrentJob>, // jobs running now (0..N)
+    #[serde(default)]
+    pub last_completed: Vec<CompletedJob>, // finished jobs, newest first (capped)
     pub error_code: Option<String>,
-    pub chemical_level_status: LevelStatus,
-    pub process_complete: ProcessStatus,
-    pub beaker_cleaning_status: CleaningStatus,
-    pub alarm_triggered: bool,
-    pub alarm_message: Option<String>,
     pub sensors: Vec<Sensor>,
     pub chemical_storage: Vec<f64>, // 8 cylinders, fill level 0-100%
-    #[serde(default)]
-    pub beaker_chemicals: Vec<String>, // chemical loaded in each beaker 1-8 ("" = empty)
-    pub job_date_time: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +135,7 @@ pub struct MachineConnection {
 pub struct ConnectionPayload {
     pub timestamp: DateTime<Utc>,
     pub device_id: String,
-    pub connection_state: String, // "ONLINE" | "OFFLINE"
+    pub connection_state: i64, // 1=ONLINE, 2=OFFLINE (see ICD code tables)
 }
 
 fn sensor(id: &str, name: &str, value: Option<f64>, unit: Option<&str>) -> Sensor {
@@ -177,35 +160,12 @@ impl MachineState {
     pub fn idle() -> Self {
         Self {
             system_status: SystemStatus::Idle,
-            current_job: None,
-            current_job_steps: Vec::new(),
-            last_completed_job: None,
-            last_completed_steps: Vec::new(),
-            last_completed_at: None,
-            completed_jobs: Vec::new(),
-            cycle_time_sec: 0,
+            current_jobs: Vec::new(),
+            last_completed: Vec::new(),
             error_code: None,
-            chemical_level_status: LevelStatus::Ok,
-            process_complete: ProcessStatus::NotStarted,
-            beaker_cleaning_status: CleaningStatus::Idle,
-            alarm_triggered: false,
-            alarm_message: None,
             sensors: base_sensors(),
             // Spread across the colour ranges so the dashboard is illustrative.
             chemical_storage: vec![85.0, 62.0, 48.0, 33.0, 18.0, 8.0, 0.0, 55.0],
-            // Which chemical each beaker (1-8) is loaded with ("" = empty).
-            beaker_chemicals: vec![
-                "BOE".to_string(),
-                "50%HCL; 50%HNO3".to_string(),
-                "MAE".to_string(),
-                "HF".to_string(),
-                String::new(),
-                String::new(),
-                "HF".to_string(),
-                "Choline hydroxide".to_string(),
-            ],
-            job_date_time: None,
-            updated_at: Utc::now(),
         }
     }
 

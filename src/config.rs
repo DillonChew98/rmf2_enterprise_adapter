@@ -100,7 +100,7 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1883),
             manufacturer: env::var("MACHINE_MANUFACTURER")
-                .unwrap_or_else(|_| "acme-delayer".to_string()),
+                .unwrap_or_else(|_| "SankeiEagle".to_string()),
             device_id: env::var("MACHINE_DEVICE_ID")
                 .unwrap_or_else(|_| "delayer-01".to_string()),
         };

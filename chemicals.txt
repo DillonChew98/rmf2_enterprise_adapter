@@ -1,9 +1,12 @@
-# Delayering chemical catalog — one chemical per line. Edit and restart the
-# adapter; the UI re-fetches from GET /api/chemicals. Lines starting with # are
-# comments. If this file is missing/empty, the built-in defaults are used.
-BOE
-HCl
-HNO3
-HF
-Poly etch (MAE)
-Choline hydroxide
+# Delayering chemical catalog — one chemical per line. Position = chemical code
+# (line 1 = code 1, line 2 = code 2, …). Edit and restart the adapter; the UI
+# re-fetches from GET /api/chemicals. Lines starting with # are comments.
+# If this file is missing/empty, the built-in defaults are used.
+Nitric Acid 70% (HNO3)
+Hydrofluoric Acid 49% (HF)
+Hydrochloric Acid 37% (HCl)
+95% Poly Etch MAE (MAE)
+BOE 7:1 (BOE)
+Choline Hydroxide
+Spare 1
+Spare 2

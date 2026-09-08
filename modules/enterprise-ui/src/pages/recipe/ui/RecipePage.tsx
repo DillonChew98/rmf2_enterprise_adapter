@@ -19,20 +19,18 @@ import {
   recipeLabel,
   type MixPreset,
 } from "@/entities/mix-preset";
-import {
-  MAX_MIX_COMPONENTS,
-  PROCESS_METHODS,
-  PROCESS_METHOD_LABELS,
-} from "@/entities/job-request";
+import { MAX_MIX_COMPONENTS } from "@/entities/job-request";
 
-const METHOD_OPTIONS = PROCESS_METHODS.map((m) => ({
-  value: m,
-  label: PROCESS_METHOD_LABELS[m],
-}));
+// method wire codes: 1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE
+const METHOD_OPTIONS = [
+  { value: "1", label: "NIL" },
+  { value: "2", label: "Ultrasonic" },
+  { value: "3", label: "Heated plate" },
+];
 
 interface Comp {
-  chemical: string;
-  parts: number;
+  chemical: number; // chemical code; 0 = none
+  percent: number;
 }
 
 export function RecipePage() {
@@ -45,36 +43,50 @@ export function RecipePage() {
   });
   const recipes = mixState.status === "ok" ? mixState.data : [];
 
+  const [name, setName] = useState("");
+  const [nameEdited, setNameEdited] = useState(false);
   const [mode, setMode] = useState<"single" | "mix">("single");
-  const [chemical, setChemical] = useState("");
-  const [comps, setComps] = useState<Comp[]>([{ chemical: "", parts: 100 }]);
-  const [method, setMethod] = useState("NIL");
+  const [chemical, setChemical] = useState(0); // chemical code; 0 = none
+  const [comps, setComps] = useState<Comp[]>([{ chemical: 0, percent: 0 }]);
+  const [method, setMethod] = useState(1); // 1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE
   const [durMin, setDurMin] = useState("");
   const [durSec, setDurSec] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  // The operator enters minutes + seconds; the recipe stores a single integer
+  // of total seconds.
+  const durationSec =
+    (parseInt(durMin, 10) || 0) * 60 + (parseInt(durSec, 10) || 0);
   const draft: MixPreset = {
     name: "",
-    mode,
+    mode: mode === "mix" ? 2 : 1,
     chemical,
     components: comps,
     method,
-    durationMin: durMin,
-    durationSec: durSec,
+    durationSec,
   };
+  // The name auto-fills from the composition, but the operator can rename it.
+  // Clearing the field reverts to the auto name.
   const label = recipeLabel(draft);
-  const ratioTotal = comps
-    .filter((c) => c.chemical.trim() !== "")
-    .reduce((s, c) => s + (c.parts || 0), 0);
+  const displayName = nameEdited ? name : label;
+  const percentTotal = comps
+    .filter((c) => c.chemical > 0)
+    .reduce((s, c) => s + (c.percent || 0), 0);
 
   const optionsFor = (row: number) => {
+    // Options carry the chemical code as a stringified value.
     const used = new Set(
-      comps.filter((_, k) => k !== row).map((c) => c.chemical).filter(Boolean)
+      comps
+        .filter((_, k) => k !== row)
+        .map((c) => c.chemical)
+        .filter((code) => code > 0)
+        .map(String)
     );
+    const current = comps[row] ? String(comps[row].chemical) : "";
     return chemicalOptions.filter(
-      (o) => o.value === comps[row]?.chemical || !used.has(o.value)
+      (o) => o.value === current || !used.has(o.value)
     );
   };
 
@@ -82,10 +94,12 @@ export function RecipePage() {
     setComps((prev) => prev.map((c, k) => (k === i ? { ...c, ...patch } : c)));
 
   function reset() {
+    setName("");
+    setNameEdited(false);
     setMode("single");
-    setChemical("");
-    setComps([{ chemical: "", parts: 100 }]);
-    setMethod("NIL");
+    setChemical(0);
+    setComps([{ chemical: 0, percent: 0 }]);
+    setMethod(1);
     setDurMin("");
     setDurSec("");
   }
@@ -93,30 +107,33 @@ export function RecipePage() {
   async function save() {
     setError(null);
     setSaved(null);
+    const recipeName = displayName.trim();
+    if (!recipeName) return setError("Enter a recipe name");
     if (mode === "single") {
       if (!chemical) return setError("Select a chemical");
     } else {
-      const valid = comps.filter((c) => c.chemical.trim() !== "");
+      const valid = comps.filter((c) => c.chemical > 0);
       if (valid.length < 1) return setError("Add at least one chemical");
-      const names = valid.map((c) => c.chemical);
-      if (new Set(names).size !== names.length)
+      const codes = valid.map((c) => c.chemical);
+      if (new Set(codes).size !== codes.length)
         return setError("Chemicals must be unique");
-      const total = valid.reduce((s, c) => s + (c.parts || 0), 0);
-      if (total !== 100)
-        return setError(`Ratios must add up to 100% (currently ${total}%)`);
+      if (valid.some((c) => !(c.percent > 0)))
+        return setError("Each chemical needs a percentage");
+      if (percentTotal !== 100)
+        return setError(`Percentages must add up to 100% (currently ${percentTotal}%)`);
     }
-    if (!durMin.trim() && !durSec.trim()) return setError("Enter a duration");
+    if (durationSec <= 0) return setError("Enter a duration");
 
     const preset: MixPreset = {
       ...draft,
-      chemical: mode === "single" ? chemical : "",
-      components: mode === "mix" ? comps.filter((c) => c.chemical.trim()) : [],
-      name: label,
+      chemical: mode === "single" ? chemical : 0,
+      components: mode === "mix" ? comps.filter((c) => c.chemical > 0) : [],
+      name: recipeName,
     };
     setSaving(true);
     try {
       await saveMixPreset(preset);
-      setSaved(label);
+      setSaved(recipeName);
       reset();
       refetch();
     } catch (e) {
@@ -139,6 +156,17 @@ export function RecipePage() {
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card title="New recipe">
           <div className="space-y-4">
+            <Input
+              label="Recipe name"
+              placeholder="e.g. BOE etch step 1"
+              value={displayName}
+              onChange={(e) => {
+                const v = e.target.value;
+                setName(v);
+                setNameEdited(v.trim() !== "");
+              }}
+            />
+
             {/* single / mix */}
             <div className="inline-flex overflow-hidden rounded-md border border-slate-300">
               {(["single", "mix"] as const).map((m) => (
@@ -163,8 +191,8 @@ export function RecipePage() {
                 label="Chemical"
                 placeholder="Select chemical"
                 options={chemicalOptions}
-                value={chemical}
-                onChange={(e) => setChemical(e.target.value)}
+                value={chemical ? String(chemical) : ""}
+                onChange={(e) => setChemical(Number(e.target.value) || 0)}
               />
             ) : (
               <div className="space-y-2">
@@ -175,18 +203,20 @@ export function RecipePage() {
                         label={`Chemical ${i + 1}`}
                         placeholder="Select"
                         options={optionsFor(i)}
-                        value={c.chemical}
-                        onChange={(e) => update(i, { chemical: e.target.value })}
+                        value={c.chemical ? String(c.chemical) : ""}
+                        onChange={(e) =>
+                          update(i, { chemical: Number(e.target.value) || 0 })
+                        }
                       />
                       <Input
-                        label="Ratio (%)"
+                        label="Percent (%)"
                         type="number"
                         min={0}
                         max={100}
                         step={1}
-                        value={c.parts}
+                        value={c.percent}
                         onChange={(e) =>
-                          update(i, { parts: Number(e.target.value) })
+                          update(i, { percent: Number(e.target.value) })
                         }
                       />
                     </div>
@@ -204,7 +234,7 @@ export function RecipePage() {
                 <Button
                   variant="secondary"
                   size="sm"
-                  onClick={() => setComps([...comps, { chemical: "", parts: 0 }])}
+                  onClick={() => setComps([...comps, { chemical: 0, percent: 0 }])}
                   disabled={comps.length >= MAX_MIX_COMPONENTS}
                 >
                   + Add chemical
@@ -216,10 +246,10 @@ export function RecipePage() {
                   <span
                     className={cn(
                       "font-medium",
-                      ratioTotal === 100 ? "text-emerald-600" : "text-rose-600"
+                      percentTotal === 100 ? "text-emerald-600" : "text-rose-600"
                     )}
                   >
-                    Total: {ratioTotal}% {ratioTotal === 100 ? "✓" : "(must be 100%)"}
+                    Total: {percentTotal}%
                   </span>
                 </div>
               </div>
@@ -228,8 +258,8 @@ export function RecipePage() {
             <Select
               label="Option"
               options={METHOD_OPTIONS}
-              value={method}
-              onChange={(e) => setMethod(e.target.value)}
+              value={String(method)}
+              onChange={(e) => setMethod(Number(e.target.value) || 1)}
             />
 
             <Field label="Duration">
@@ -284,8 +314,9 @@ export function RecipePage() {
           ) : (
             <ul className="divide-y divide-slate-100">
               {recipes.map((r) => (
-                <li key={r.name} className="py-3 text-sm text-slate-800">
-                  {recipeLabel(r)}
+                <li key={r.name} className="py-3 text-sm">
+                  <p className="font-medium text-slate-900">{r.name}</p>
+                  <p className="text-xs text-slate-500">{recipeLabel(r)}</p>
                 </li>
               ))}
             </ul>

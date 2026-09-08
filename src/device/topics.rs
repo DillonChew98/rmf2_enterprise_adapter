@@ -6,10 +6,10 @@ pub struct MachineTopics {
     pub connection: String,
     pub state: String,
     pub request: String,
-    /// Device publishes its mix-preset list here (retained).
-    pub mixes: String,
-    /// FCS publishes a new mix preset to save here.
-    pub mixes_save: String,
+    /// Device publishes its recipe list here (retained).
+    pub recipes: String,
+    /// FCS publishes a new recipe to save here.
+    pub recipes_save: String,
 }
 
 impl MachineTopics {
@@ -19,8 +19,8 @@ impl MachineTopics {
             connection: format!("{base}/connection"),
             state: format!("{base}/state"),
             request: format!("{base}/request"),
-            mixes: format!("{base}/mixes"),
-            mixes_save: format!("{base}/mixes/save"),
+            recipes: format!("{base}/recipes"),
+            recipes_save: format!("{base}/recipes/save"),
         }
     }
 }

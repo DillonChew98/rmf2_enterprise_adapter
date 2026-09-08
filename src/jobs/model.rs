@@ -1,13 +1,16 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-/// A submitted delayering job. Common LIMS-derived + operator fields, plus a
-/// `jobType`-discriminated body. Mirrors the UI's `DelayeringJobRequest`.
+/// A submitted delayering work order. One order (jobOrder) loads several ports,
+/// each with its own LIMS job + recipe. Mirrors the UI's `DelayeringJobRequest`.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixComponent {
-    pub chemical: String,
-    pub parts: i64,
+    pub chemical: i64, // chemical code (see catalog / ICD chemical code table)
+    #[serde(default)]
+    pub percent: i64, // share of this chemical in the mix (0–100); components sum to 100
 }
 
 /// One chemical process step — a snapshot of the recipe the operator picked.
@@ -17,55 +20,68 @@ pub struct ChemicalStep {
     #[serde(default)]
     pub recipe_name: String,
     #[serde(default)]
-    pub mode: String, // "single" | "mix"
+    pub mode: i64, // 1=single, 2=mix (see ICD code tables)
     #[serde(default)]
-    pub chemical: String,
+    pub chemical: i64, // single: chemical code (0 when mix)
     #[serde(default)]
     pub components: Vec<MixComponent>,
     #[serde(default)]
-    pub method: String, // "ULTRASONIC" | "HEATED_PLATE" | "ETCHING"
+    pub method: i64, // method code: 1=NIL, 2=ULTRASONIC, 3=HEATED_PLATE
     #[serde(default)]
-    pub duration_min: String,
-    #[serde(default)]
-    pub duration_sec: String,
+    pub duration_sec: i64, // total duration in seconds
 }
 
+/// The job loaded on one port: a LIMS reference + the recipe steps to run.
+/// LIMS-derived context (analysis type, status, submission time) is deliberately
+/// omitted — the machine only needs the job reference, stain, and the recipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Cleaning {
-    pub mode: String, // "ALL" | "SELECTED"
+pub struct PortJob {
+    pub job_number: String, // LIMS reference (may repeat across ports/orders)
     #[serde(default)]
-    pub beakers: Vec<String>, // selected beakers e.g. ["1","3"] (when mode = SELECTED)
-}
-
-/// The mutually-exclusive job types, discriminated by `jobType`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "jobType", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum JobKind {
-    ChemicalProcess { steps: Vec<ChemicalStep> },
-    BeakerCleaning { cleaning: Cleaning },
+    pub stain: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<ChemicalStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelayeringJobRequest {
-    // LIMS-derived
-    pub job_number: String,
+    /// Unique work-order id (primary key).
     #[serde(default)]
-    pub analysis_type: String,
-    #[serde(default)]
-    pub submission_time: Option<String>,
-    #[serde(default)]
-    pub lims_status: String,
-    #[serde(default)]
-    pub stain: Option<String>,
-    // operator-supplemented
+    pub job_order: String,
     pub operator_name: String,
+    /// Per-port jobs, keyed by port number (e.g. "1", "2"). Each port can be a
+    /// different job number with its own recipe.
     #[serde(default)]
-    pub loadports: Vec<String>, // selected loadports, e.g. ["1","3"]
-    #[serde(flatten)]
-    pub job: JobKind,
-    // server-stamped at submit time
+    pub jobs: HashMap<String, PortJob>,
+    /// Server-stamped at submit time.
     #[serde(default)]
     pub submitted_at: Option<String>,
+}
+
+/// A single runnable unit the machine executes: one port's job. An order expands
+/// into one of these per port.
+#[derive(Debug, Clone)]
+pub struct RunJob {
+    pub job_order: String,
+    pub port: String,
+    pub job_number: String,
+    pub steps: Vec<ChemicalStep>,
+}
+
+impl DelayeringJobRequest {
+    /// Split the order into its per-port runnable jobs.
+    pub fn into_run_jobs(self) -> Vec<RunJob> {
+        let order = self.job_order;
+        self.jobs
+            .into_iter()
+            .map(|(port, pj)| RunJob {
+                job_order: order.clone(),
+                port,
+                job_number: pj.job_number,
+                steps: pj.steps,
+            })
+            .collect()
+    }
 }

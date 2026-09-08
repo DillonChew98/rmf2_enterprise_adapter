@@ -5,4 +5,3 @@ export { SensorPanel } from "./ui/SensorPanel";
 export { StatusGrid } from "./ui/StatusGrid";
 export { CurrentJobPanel } from "./ui/CurrentJobPanel";
 export { ChemicalStoragePanel } from "./ui/ChemicalStoragePanel";
-export { BeakerChemicalPanel } from "./ui/BeakerChemicalPanel";
